@@ -19,4 +19,5 @@
 5、若手机麦克风无法识别，请自行在设置中开启软件麦克风使用权限
 
 6、电脑版使用时不要以下弹窗
+
 <img width="484" height="190" alt="QQ_1785330113718" src="https://github.com/user-attachments/assets/e4a8df17-4e6e-4c89-bf93-f4686c3525c0" />
