@@ -1,4 +1,4 @@
-> [!NOTE] 一款自制免费非商用开源的英语听说软件
+>  一款自制免费非商用开源的英语听说软件
 
 源代码：[FallingLighty/SoloTalk: 自制免费开源听说软件](https://github.com/FallingLighty/SoloTalk)
 
