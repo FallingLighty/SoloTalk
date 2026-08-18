@@ -1467,6 +1467,7 @@ class PracticePage(QWidget):
         self._tts_next_callback = None
         self._navigating = False
         self._exam_active = False
+        self._resume_cp = None  # 练习模式恢复进度时，mic 测试通过后跳到的重进点
         self.mode = "practice"
         self._b_moments = []
         self._win_key_blocker = None
@@ -1608,6 +1609,7 @@ class PracticePage(QWidget):
         self._exam_active = False
         self._teardown_done = False
         self._navigating = False
+        self._resume_cp = None
         self._current_phase = None
         self._step_index = 0
         self._b_step = 0
@@ -1787,7 +1789,14 @@ class PracticePage(QWidget):
         # 若用户直接关闭对话框（未选择），保持当前初始状态，进度文件保留供下次处理
 
     def _restore_progress(self, data):
-        """根据保存的进度数据恢复 session、录音路径与当前检查点，并继续考试。"""
+        """根据保存的进度数据恢复 session、录音路径与当前检查点，并继续考试。
+
+        重进规则（彻底抛弃前面的精确恢复）：
+        - Part A: 未到录音结束(idx<7) → 从 A 开场白(idx=0, PartA-Intro) 开始
+        - Part B: 未到第1个录音点 → 从 B 开头(PartB-Intro) 开始；
+                   已到录音点区域 → 从该录音点的准备点（prep_q / 请听问题）开始
+        - Part C: 始终从 C 开头(PartC-Intro) 开始
+        """
         self.pkg = self.main.current_package
         self.session = PracticeSession(self.pkg.meta.get("name", "练习"))
         recs = data.get("recordings", {})
@@ -1818,15 +1827,187 @@ class PracticePage(QWidget):
         self._c_step = data.get("c_step", 0)
         self.video_duration = data.get("video_duration", 60)
 
+        # 统一用 G 列（_REENTRY_CHECKPOINTS）算出重进目标
         if phase == "partA":
-            self._go_to_checkpoint(("partA", self._step_index), replay=True)
+            cp = self._find_reentry_checkpoint(self._REENTRY_CHECKPOINTS, "partA", self._step_index)
+            target = cp if cp else ("partA", 0)
         elif phase == "partB":
-            self._go_to_checkpoint(("partB", self._b_step), replay=True)
+            first_rec = self._first_b_record_index()
+            if self._b_step < first_rec:
+                target = ("partB", 0)          # 没到第1个录音点，从 B 开头开始
+            else:
+                cp = self._find_reentry_checkpoint(self._REENTRY_CHECKPOINTS, "partB", self._b_step)
+                target = cp if cp else ("partB", 0)
         elif phase == "partC":
-            self._go_to_checkpoint(("partC", self._c_step), replay=True)
+            target = ("partC", 0)              # 始终从 C 开头开始
         else:
-            # 未知阶段，回到 Part A
-            self._run_part_a()
+            target = ("partA", 0)
+
+        # 直接跳到重进点（练习/模考统一，不重复 mic 测试）
+        self._go_to_checkpoint(target, replay=True)
+
+    # ---------- 检查点表（来自页面清单 Excel 列 G / 列 H） ----------
+    #
+    # 列 G「重进落点」：_restore_progress 用（重进/断点续传时的起始页）
+    # 列 H「上一步落点」：_prev_checkpoint 使用（按"上一步"按钮时跳到的目标）
+    #
+    # 规则：↑ 表示当前页的 上一步/重进 目标 = 往上找最近的 ● 标记页
+    #       无   表示录音中，不可上一步（按钮置灰）
+    #
+    # 两套表的差异：
+    #   - H 表多了 A-recordPrep（step=6），G 表没有
+    #   - G 表有 B-intro（b_step=0），H 表没有（B-intro 的 ↑ 跳到 A-recordPrep）
+    #
+
+    # H 列：上一步目标（_prev_checkpoint 使用）
+    _PREV_CHECKPOINTS = [
+        ("partA", 0,  "A-intro"),         # R2
+        ("partA", 6,  "A-recordPrep"),    # R8  ← 比 G 多此行！
+        ("partB", 4,  "B-prepQ1"),        # R14 (b_step=4, prep_q idx=0)
+        ("partB", 7,  "B-prepQ2"),        # R17 (b_step=7, prep_q idx=1)
+        ("partB", 10, "B-prepQ3"),        # R20 (b_step=10, prep_q idx=2)
+        ("partB", 14, "B-hearQ1"),        # R24 (b_step=14, hear_q idx=0)
+        ("partB", 18, "B-hearQ2"),        # R28 (b_step=18, hear_q idx=1)
+        ("partB", 22, "B-hearQ3"),        # R32 (b_step=22, hear_q idx=2)
+        ("partB", 26, "B-hearQ4"),        # R36 (b_step=26, hear_q idx=3)
+        ("partB", 30, "B-hearQ5"),        # R40 (b_step=30, hear_q idx=4)
+        ("partC", 0,  "C-intro"),         # R44
+    ]
+
+    # G 列：重进目标（_restore_progress 使用）
+    _REENTRY_CHECKPOINTS = [
+        ("partA", 0,  "A-intro"),         # R2
+        ("partB", 0,  "B-intro"),          # R10 ← H 表没有此行（B-intro 的 ↑ 跳到 A-recordPrep）
+        ("partB", 4,  "B-prepQ1"),        # R14
+        ("partB", 7,  "B-prepQ2"),        # R17
+        ("partB", 10, "B-prepQ3"),        # R20
+        ("partB", 14, "B-hearQ1"),        # R24
+        ("partB", 18, "B-hearQ2"),        # R28
+        ("partB", 22, "B-hearQ3"),        # R32
+        ("partB", 26, "B-hearQ4"),        # R36
+        ("partB", 30, "B-hearQ5"),        # R40
+        ("partC", 0,  "C-intro"),         # R44
+    ]
+
+    # I 列：跳过 / 结束录音落点（_skip_advance 使用，来源于 Excel 第 9 列「跳过/结束录音」）
+    #   非录音页：跳过 = 前进到下一页；
+    #   录音页  ：结束录音 = 先保存当前录音，再前进到箭头指向的页；
+    #   C-record：结束录音批改 = 保存后进入批改（signal_finished）。
+    # 值与 Excel 行严格对应：A 0-7 / B 0-33 / C 0-7。
+    _SKIP_NEXT = {
+        # ---- Part A ----
+        ("partA", 0): ("partA", 1),   # A-intro     -> A-video
+        ("partA", 1): ("partA", 2),   # A-video     -> A-prep
+        ("partA", 2): ("partA", 3),   # A-prep      -> A-read
+        ("partA", 3): ("partA", 4),   # A-read      -> A-preListen
+        ("partA", 4): ("partA", 5),   # A-preListen -> A-listen
+        ("partA", 5): ("partA", 6),   # A-listen    -> A-recordPrep
+        ("partA", 6): ("partA", 7),   # A-recordPrep-> A-record
+        ("partA", 7): ("partB", 0),   # A-record    -> 结束录音跳B-intro
+        # ---- Part B ----
+        ("partB", 0): ("partB", 1),   # B-intro     -> B-situation
+        ("partB", 1): ("partB", 2),   # B-situation -> B-listen
+        ("partB", 2): ("partB", 3),   # B-listen    -> B-askGuide
+        ("partB", 3): ("partB", 4),   # B-askGuide  -> B-prepQ1
+        ("partB", 4): ("partB", 5),   # B-prepQ1    -> B-recQ1
+        ("partB", 5): ("partB", 6),   # B-recQ1     -> 结束录音跳B-ans1
+        ("partB", 6): ("partB", 7),   # B-ans1      -> B-prepQ2
+        ("partB", 7): ("partB", 8),   # B-prepQ2    -> B-recQ2
+        ("partB", 8): ("partB", 9),   # B-recQ2     -> 结束录音跳B-ans2
+        ("partB", 9): ("partB", 10),  # B-ans2      -> B-prepQ3
+        ("partB", 10): ("partB", 11), # B-prepQ3    -> B-recQ3
+        ("partB", 11): ("partB", 12), # B-recQ3     -> 结束录音跳B-ans3
+        ("partB", 12): ("partB", 13), # B-ans3      -> B-ansGuide
+        ("partB", 13): ("partB", 14), # B-ansGuide  -> B-hearQ1
+        ("partB", 14): ("partB", 15), # B-hearQ1    -> B-repeatQ1
+        ("partB", 15): ("partB", 16), # B-repeatQ1  -> B-prepA1
+        ("partB", 16): ("partB", 17), # B-prepA1    -> B-recA1
+        ("partB", 17): ("partB", 18), # B-recA1     -> 结束录音跳B-hearQ2
+        ("partB", 18): ("partB", 19), # B-hearQ2    -> B-repeatQ2
+        ("partB", 19): ("partB", 20), # B-repeatQ2  -> B-prepA2
+        ("partB", 20): ("partB", 21), # B-prepA2    -> B-recA2
+        ("partB", 21): ("partB", 22), # B-recA2     -> 结束录音跳B-hearQ3
+        ("partB", 22): ("partB", 23), # B-hearQ3    -> B-repeatQ3
+        ("partB", 23): ("partB", 24), # B-repeatQ3  -> B-prepA3
+        ("partB", 24): ("partB", 25), # B-prepA3    -> B-recA3
+        ("partB", 25): ("partB", 26), # B-recA3     -> 结束录音跳B-hearQ4
+        ("partB", 26): ("partB", 27), # B-hearQ4    -> B-repeatQ4
+        ("partB", 27): ("partB", 28), # B-repeatQ4  -> B-prepA4
+        ("partB", 28): ("partB", 29), # B-prepA4    -> B-recA4
+        ("partB", 29): ("partB", 30), # B-recA4     -> 结束录音跳B-hearQ5
+        ("partB", 30): ("partB", 31), # B-hearQ5    -> B-repeatQ5
+        ("partB", 31): ("partB", 32), # B-repeatQ5  -> B-prepA5
+        ("partB", 32): ("partB", 33), # B-prepA5    -> B-recA5
+        ("partB", 33): ("partC", 0),  # B-recA5     -> 结束录音跳C-intro
+        # ---- Part C ----
+        ("partC", 0): ("partC", 1),   # C-intro     -> C-keywords
+        ("partC", 1): ("partC", 2),   # C-keywords  -> C-monologue1
+        ("partC", 2): ("partC", 3),   # C-monologue1-> C-gap
+        ("partC", 3): ("partC", 4),   # C-gap       -> C-monologue2
+        ("partC", 4): ("partC", 5),   # C-monologue2-> C-prepRetell
+        ("partC", 5): ("partC", 6),   # C-prepRetell-> C-recordPrep
+        ("partC", 6): ("partC", 7),   # C-recordPrep-> C-record
+        ("partC", 7): "FINISH",       # C-record    -> 结束录音批改
+    }
+
+    @staticmethod
+    def _find_prev_checkpoint(checkpoints, phase, step):
+        """在 checkpoints 表中，找同 phase 内 step < 当前 step 的最后一个 ●。
+
+        找不到则回退到上一个 phase 的最后一个 ●。
+        """
+        prev_cp = None
+        found_phase = False
+        for cp_phase, cp_step, _cp_name in checkpoints:
+            if cp_phase == phase:
+                found_phase = True
+                if cp_step < step:
+                    prev_cp = (cp_phase, cp_step)
+                else:
+                    break  # 已超过当前 step，停止
+            elif found_phase:
+                break  # 已离开当前 phase
+        if prev_cp:
+            return prev_cp
+        # 当前 phase 没有更早的 ● → 回到上一个 phase 最后一个 ●
+        last_of_prev = None
+        for cp_phase, cp_step, _cp_name in checkpoints:
+            if cp_phase == phase:
+                break
+            last_of_prev = (cp_phase, cp_step)
+        return last_of_prev
+
+    @staticmethod
+    def _find_reentry_checkpoint(checkpoints, phase, step):
+        """在 checkpoints 表中，找同 phase 内 step <= 当前 step 的最后一个 ●。
+
+        用于 _restore_progress：从保存位置往前找到最近的重进起点。
+        """
+        best_cp = None
+        for cp_phase, cp_step, _cp_name in checkpoints:
+            if cp_phase == phase:
+                if cp_step <= step:
+                    best_cp = (cp_phase, cp_step)
+                else:
+                    break
+            elif best_cp is not None:
+                break
+        # 如果当前 phase 没有 ≤ step 的 ●（比如 partA step≥7 且 G 表只有 step=0），
+        # 返回该 phase 第一个 ●（即从头开始）
+        if best_cp is None:
+            for cp_phase, cp_step, _cp_name in checkpoints:
+                if cp_phase == phase:
+                    best_cp = (cp_phase, cp_step)
+                    break
+        return best_cp
+
+    def _first_b_record_index(self):
+        """返回 Part B moments 中第一个录音点(record_q/record_a)的索引。"""
+        moments = getattr(self, "_b_moments", [])
+        for i, m in enumerate(moments):
+            if m["t"] in ("record_q", "record_a"):
+                return i
+        return len(moments)
 
     def _enter_fullscreen(self):
         if sys.platform == "win32":
@@ -1865,7 +2046,12 @@ class PracticePage(QWidget):
     def _update_nav_buttons(self):
         """根据模式与考试状态更新跳过/上一步按钮：
         - 模考模式：直接隐藏（用不了）；
-        - 练习模式：始终显示，考试中启用、未考试时禁用。"""
+        - 练习模式：始终显示，考试中启用、未考试时禁用。
+        上一步按钮（练习模式）仅在以下 3 种情况禁用：
+          1. 试音/准备阶段（mic phase）
+          2. A-intro（Part A 开头介绍，step=0）
+          3. 录音中
+        其余所有页面（A 段其余步骤、B 段全部、C 段全部）上一步均可点。"""
         if self.mode == "exam":
             self.skip_btn.setVisible(False)
             self.prev_btn.setVisible(False)
@@ -1873,8 +2059,19 @@ class PracticePage(QWidget):
         self.skip_btn.setVisible(True)
         self.prev_btn.setVisible(True)
         active = getattr(self, "_exam_active", False)
+        rec = getattr(self, "_is_recording", False)
+        # 跳过按钮：考试中始终可用；录音中它化身「结束录音」（见 _update_skip_label）
         self.skip_btn.setEnabled(active)
-        self.prev_btn.setEnabled(active)
+        # 上一步按钮：仅在 试音开头 / A-intro / 录音中 禁用
+        can_prev = active and not rec
+        if can_prev:
+            phase = getattr(self, "_current_phase", "")
+            if phase == "mic":
+                can_prev = False                      # 1. 试音/准备阶段
+            elif phase == "partA" and self._cur_step() == 0:
+                can_prev = False                      # 2. A-intro 开头介绍
+            # 其他情况（A 段其余、B 段、C 段）保持可用
+        self.prev_btn.setEnabled(can_prev)
         self._update_skip_label()
 
     def set_mode(self, mode):
@@ -1924,14 +2121,13 @@ class PracticePage(QWidget):
         self._set_timer(10, self._mic_test_playback)
 
     def _mic_test_playback(self):
+        # 守卫：若已被跳过/导航离开 mic 阶段（_current_phase 不再是 "mic"），静默返回不弹窗
+        if self._current_phase != "mic":
+            return
         self._stop_recording()
         test_path = self._save_recording("mic_test")
         if os.path.exists(test_path):
-            if self.mode == "practice":
-                # 练习模式：不弹“麦克风是否正常”询问，直接回放后进入 Part A
-                self._player_play_then(test_path, self._run_part_a)
-                return
-            # 模考模式：保留“麦克风是否正常”询问
+            # 练习/模考统一：播放录音 → 弹窗确认 → 进入 Part A
             media = self.vlc_instance.media_new(test_path)
             self.player.set_media(media)
             self.player.play()
@@ -1943,7 +2139,7 @@ class PracticePage(QWidget):
                     os.remove(test_path)
                 except:
                     pass
-                self.signal_update_display.emit("准备开始", "即将开始模考")
+                self.signal_update_display.emit("准备开始", "即将开始" + ("模考" if self.mode == "exam" else "练习"))
                 self._set_timer(3, self._run_part_a)
             else:
                 try:
@@ -2004,6 +2200,58 @@ class PracticePage(QWidget):
                 QMessageBox.warning(self, "警告", "音频文件不存在，改用 TTS 朗读")
             self._set_tts_callback(callback)
             self._start_tts(text, self.signal_tts_next)
+
+    # ---- 官方提示音播放 ----
+    def _play_prompt_audio(self, name, callback):
+        """播放 material/ 下的官方提示音 mp3，播完触发 callback。
+        文件不存在时静默跳过直接 callback（不弹窗）。"""
+        path = os.path.join("material", f"{name}.mp3")
+        resolved = _resolve_resource_file(path)
+        if resolved and os.path.isfile(resolved):
+            self._audio_callback = callback
+            media = self.vlc_instance.media_new(resolved)
+            self.player.set_media(media)
+            self.player.play()
+            self.display_stack.setCurrentWidget(self.text_display)
+            QTimer.singleShot(80, lambda: self._delayed_set_volume(100))
+        else:
+            # 文件缺失时直接回调（不阻塞流程）
+            callback()
+
+    def _play_beep(self, callback):
+        """播放滴声 di.mp3，结束后触发 callback。文件不存在则直接 callback。
+
+        注意：滴声是「过场提示音」，播放时**不强制切换画面**——
+        这样 Part A 模仿跟读在滴声期间仍能保持视频画面，
+        Part B/C 也能保留滴声前已显示的录音准备界面。
+
+        触发机制：用 di.mp3 的 duration 定时器直接触发 callback（di.mp3 只有
+        约 470ms，真机 VLC 对这种极短音频的 EndReached 事件经常不发/延迟，
+        纯靠事件会卡住，所以改用纯定时器 100% 兜底）。"""
+        path = os.path.join("material", "di.mp3")
+        resolved = _resolve_resource_file(path)
+        if resolved and os.path.isfile(resolved):
+            # 防重入：callback 只触发一次
+            fired = [False]
+            def fire_once():
+                if not fired[0]:
+                    fired[0] = True
+                    callback()
+            self.player.set_media(self.vlc_instance.media_new(resolved))
+            self.player.play()
+            QTimer.singleShot(80, lambda: self._delayed_set_volume(100))
+            # 用 duration + 缓冲 定时器触发回调（不依赖 EndReached 事件）
+            try:
+                duration_ms = self.player.get_media().get_duration()
+            except Exception:
+                duration_ms = 0
+            if duration_ms and duration_ms > 0:
+                wait_ms = max(800, int(duration_ms) + 300)
+            else:
+                wait_ms = 1000  # 拿不到时长时给 1s 兜底
+            QTimer.singleShot(wait_ms, fire_once)
+        else:
+            callback()
 
     def _tts_runner(self, text, signal, force_fallback=False):
         # 优先 edge-tts（神经网络语音）：生成 mp3 后回主线程用 VLC 播放，播完再触发 signal
@@ -2124,46 +2372,57 @@ class PracticePage(QWidget):
             self._parse_timer = None
 
     def _exec_partA_step(self):
+        self._update_nav_buttons()  # 每步切换时刷新导航按钮（上一步/跳过可用态）
         idx = self._step_index
         # 进入非视频步骤时，确保视频已停并隐藏（修复离开视频步骤视频仍残留的问题）
-        if idx not in (1, 6):
+        if idx not in (1, 7):
             self._stop_video()
         if idx == 0:
+            # 开头介绍：播放官方录音（含中英双语）
             self.signal_update_display.emit("Part A Reading Aloud",
                 "In this part, you are required to watch a video clip and read after the speaker.")
-            self._set_tts_callback(self._next_partA_step)
-            self._start_tts("Part A Reading Aloud. In this part, you are required to watch a video clip and read after the speaker in the video.", self.signal_tts_next)
+            self._play_prompt_audio("PartA-Intro", self._next_partA_step)
         elif idx == 1:
             self.signal_update_display.emit("观看视频", "请观看视频并注意发音")
             self._play_video_full()
             self._set_timer(self.video_duration)
         elif idx == 2:
+            # 准备时问：播放官方录音（含中文"现在你有一分钟的准备时间..."）
             self.signal_update_display.emit("练习提示", "Now you have one minute to practice reading")
-            self._set_tts_callback(self._next_partA_step)
-            self._start_tts("Now you have one minute to practice reading", self.signal_tts_next)
+            self._play_prompt_audio("PartA-2", self._next_partA_step)
         elif idx == 3:
             self.signal_update_display.emit("阅读文本", "请默读准备 (60秒)")
             self._show_text(self.pkg.partA_hidden_text or "(无原文)")
             self._set_timer(60)
         elif idx == 4:
+            # 听原文前提示：播放官方录音（"下面听原文，再听一遍录音..."）
+            # 只显示提示文字，不提前展示原文（原文在下一步 idx=5 才出现）
+            self.signal_update_display.emit("听原文前提示", "下面听原文，再听一遍录音。\nNow listen to the speaker once again...")
+            self._play_prompt_audio("PartA-3", self._next_partA_step)
+        elif idx == 5:
             self.signal_update_display.emit("听录音", "听视频原声，可看文本")
             self._show_text(self.pkg.partA_hidden_text or "(无原文)")
             self._play_video_audio_only()
             self._set_timer(self.video_duration)
-        elif idx == 5:
-            self.signal_update_display.emit("录音准备", "Now read as the speaker in the video")
-            self._set_tts_callback(self._next_partA_step)
-            self._start_tts("Now read as the speaker in the video", self.signal_tts_next)
         elif idx == 6:
+            # 录音前提示：播放官方录音（含中文"现在开始录音"+英文）
+            self.signal_update_display.emit("录音准备", "Now read as the speaker in the video")
+            self._play_prompt_audio("PartA-4", self._next_partA_step)
+        elif idx == 7:
+            # 录音：先播滴声再开始录音
             self.signal_update_display.emit("模仿朗读", "请看着视频和字幕跟读")
-            self._play_video_silent()
-            self._start_recording()
-            self._set_timer(self.video_duration)
+            self._play_beep(lambda: self._begin_partA_record())
         else:
             self._stop_video()
             self._stop_recording()
             self.session.partA_recording = self._save_recording("PartA")
             self._run_part_b()
+
+    def _begin_partA_record(self):
+        """Part A 开始录音（滴声结束后调用）。"""
+        self._play_video_silent()
+        self._start_recording()
+        self._set_timer(self.video_duration)
 
     def _next_partA_step(self):
         self._step_index += 1
@@ -2177,28 +2436,45 @@ class PracticePage(QWidget):
         # 把整个 Part B 拆成一系列「机读 / 录音 / 准备」小点，
         # 每个点都是一次「跳过 / 上一步」的目标，保证只前进/后退一步。
         self._b_moments = []
-        self._b_moments.append({"t": "tts", "main": "Part B Role Play",
+        # 0: 开头介绍 — 播放官方录音（完整文本，中英双语）
+        self._b_moments.append({"t": "prompt", "main": "Part B Role Play",
                                 "sub": "In this part, you are required to act as a role and complete the following tasks.",
-                                "text": "Part B Role Play. In this part, you are required to act as a role and complete the following tasks."})
+                                "audio": "PartB-Intro"})
         self._b_moments.append({"t": "timer", "sec": 30, "main": "情景介绍", "sub": self.pkg.partB_situation or "(无)"})
         self._b_moments.append({"t": "tts", "main": "听对话", "sub": self.pkg.partB_situation or "(情景)",
                                 "text": self.pkg.partB_listening_text,
                                 "audio": self.pkg.partB_listening_audio})
+        # 提问引导 — 播放官方录音（"下面你用英语提出三个问题..."）
+        self._b_moments.append({"t": "prompt", "main": "提问引导",
+                                "sub": "下面你用英语提出三个问题。\nPlease get ready to ask three questions in English.",
+                                "audio": "PartB-1"})
         for idx, q in enumerate(self.pkg.partB_three_questions):
             self._b_moments.append({"t": "prep_q", "idx": idx, "main": f"准备提问 {idx+1}", "sub": q['cn_prompt']})
+            # 提问录音：先播滴声再开始录音
             self._b_moments.append({"t": "record_q", "idx": idx, "main": f"请提问 {idx+1}", "sub": q['cn_prompt']})
             self._b_moments.append({"t": "tts", "main": "电脑回答", "sub": "", "text": q['en_answer'],
                                     "audio": q.get('en_audio')})
+        # 回答引导 — 播放官方录音（对整段回答的总引导）
+        self._b_moments.append({"t": "prompt", "main": "回答引导",
+                                "sub": "下面你用英语回答五个问题。\nPlease get ready to answer five questions in English.",
+                                "audio": "PartB-2"})
         for idx, a in enumerate(self.pkg.partB_five_answers):
-            self._b_moments.append({"t": "tts", "main": "请听问题", "sub": "", "text": a['en_question'],
-                                    "audio": a.get('q_audio')})
-            self._b_moments.append({"t": "tts", "main": "重复提问", "sub": "", "text": a['en_question'],
-                                    "audio": a.get('q_audio')})
-            self._b_moments.append({"t": "timer", "sec": 10, "main": "准备回答", "sub": ""})
-            self._b_moments.append({"t": "record_a", "idx": idx, "main": "请回答", "sub": ""})
+            self._b_moments.append({"t": "tts", "main": f"请听第{idx+1}个问题",
+                                    "sub": f"现在请准备回答第{idx+1}个问题。\nPlease get ready to answer question {idx+1}.",
+                                    "text": a['en_question'], "audio": a.get('q_audio')})
+            self._b_moments.append({"t": "tts", "main": f"请听第{idx+1}个问题",
+                                    "sub": f"现在请准备回答第{idx+1}个问题。\nPlease get ready to answer question {idx+1}.",
+                                    "text": a['en_question'], "audio": a.get('q_audio')})
+            self._b_moments.append({"t": "timer", "sec": 10, "main": f"请听第{idx+1}个问题",
+                                    "sub": f"现在请准备回答第{idx+1}个问题。\nPlease get ready to answer question {idx+1}."})
+            # 回答录音：先播滴声再开始录音
+            self._b_moments.append({"t": "record_a", "idx": idx,
+                                    "main": f"请回答第{idx+1}个问题",
+                                    "sub": f"现在请回答第{idx+1}个问题。\nPlease get ready to answer question {idx+1}."})
         self._exec_partB_step()
 
     def _exec_partB_step(self, replay=False):
+        self._update_nav_buttons()  # 每步切换时刷新导航按钮
         if self._b_step >= len(self._b_moments):
             self._run_part_c()
             return
@@ -2206,7 +2482,11 @@ class PracticePage(QWidget):
 
     def _exec_b_moment(self, m, replay=False):
         t = m["t"]
-        if t == "tts":
+        if t == "prompt":
+            # 播放官方提示音 mp3（PartB-Intro / PartB-1 / PartB-2）
+            self.signal_update_display.emit(m["main"], m.get("sub", ""))
+            self._play_prompt_audio(m["audio"], self._next_partB_step)
+        elif t == "tts":
             self.signal_update_display.emit(m["main"], m.get("sub", ""))
             self._speak_or_play_audio(m.get("text", ""), m.get("audio"), self._next_partB_step)
         elif t == "timer":
@@ -2218,22 +2498,27 @@ class PracticePage(QWidget):
         elif t == "record_q":
             idx = m["idx"]
             if replay:
-                # 重进 / 上一步 落到提问录音点：先重播题目（准备提示），再开始录音
+                # 重进 / 上一步 落到提问录音点：先重播题目（准备提示），再滴声→录音
                 self.signal_update_display.emit(f"准备提问 {idx+1}", m["sub"])
-                self._set_timer(20, callback=lambda i=idx: self._begin_b_record(i, "q"))
+                self._set_timer(20, callback=lambda i=idx: self._play_beep(lambda ii=i: self._begin_b_record_now(ii, "q")))
             else:
-                self._begin_b_record(idx, "q")
+                # 正常流程：先切到「请提问」录音界面，再播滴声→开始录音
+                self.signal_update_display.emit(m["main"], m["sub"])
+                self._play_beep(lambda i=idx: self._begin_b_record_now(i, "q"))
         elif t == "record_a":
             idx = m["idx"]
             if replay:
-                # 先重播问题（请听问题 + 重复提问），再开始录音
-                self.signal_update_display.emit("请听问题", "")
+                # 先重播问题（请听第n个问题 + 重复提问），再滴声→录音
+                self.signal_update_display.emit(f"请听第{idx+1}个问题",
+                                                f"现在请准备回答第{idx+1}个问题。\nPlease get ready to answer question {idx+1}.")
                 self._speak_or_play_audio(
                     self.pkg.partB_five_answers[idx]['en_question'],
                     self.pkg.partB_five_answers[idx].get('q_audio'),
                     lambda i=idx: self._replay_question_then_record(i))
             else:
-                self._begin_b_record(idx, "a")
+                # 正常流程：先切到「请回答第n个问题」录音界面，再播滴声→开始录音
+                self.signal_update_display.emit(m["main"], m["sub"])
+                self._play_beep(lambda i=idx: self._begin_b_record_now(i, "a"))
 
     def _finish_b_record(self, idx, kind):
         self._stop_recording()
@@ -2243,18 +2528,24 @@ class PracticePage(QWidget):
             self.session.partB_slots[f"PartB_A{idx+1}"] = self._save_recording(f"PartB_A{idx+1}")
         self._next_partB_step()
 
-    def _begin_b_record(self, idx, kind):
-        """进入某道 Part B 提问 / 回答的录音（开始录音并计时 8 秒）。"""
+    def _begin_b_record_now(self, idx, kind):
+        """Part B 滴声结束后实际开始录音（开始录音并计时 10 秒）。"""
         if kind == "q":
             self.signal_update_display.emit(f"请提问 {idx+1}", self.pkg.partB_three_questions[idx]['cn_prompt'])
         else:
-            self.signal_update_display.emit("请回答", "")
+            self.signal_update_display.emit(f"请回答第{idx+1}个问题",
+                                            f"现在请回答第{idx+1}个问题。\nPlease get ready to answer question {idx+1}.")
         self._start_recording()
-        self._set_timer(8, callback=lambda i=idx, k=kind: self._finish_b_record(i, k))
+        self._set_timer(10, callback=lambda i=idx, k=kind: self._finish_b_record(i, k))
+
+    def _begin_b_record(self, idx, kind):
+        """兼容入口：直接开始录音（无滴声）。内部流程仍走 _begin_b_record_now。"""
+        self._begin_b_record_now(idx, kind)
 
     def _replay_question_then_record(self, idx):
         """重播问题第二段（重复提问），结束后开始录音。"""
-        self.signal_update_display.emit("重复提问", "")
+        self.signal_update_display.emit(f"请听第{idx+1}个问题",
+                                        f"现在请准备回答第{idx+1}个问题。\nPlease get ready to answer question {idx+1}.")
         self._speak_or_play_audio(
             self.pkg.partB_five_answers[idx]['en_question'],
             self.pkg.partB_five_answers[idx].get('q_audio'),
@@ -2272,15 +2563,16 @@ class PracticePage(QWidget):
         self._exec_partC_step()
 
     def _exec_partC_step(self, replay=False):
+        self._update_nav_buttons()  # 每步切换时刷新导航按钮
         s = self._c_step
         # 离开“听独白”步骤时停掉播放器，避免残留视频
         if s not in (2, 4):
             self._stop_video()
         if s == 0:
+            # 开头介绍：播放官方录音（中英双语）
             self.signal_update_display.emit("Part C Retelling",
                 "In this part, you are required to listen to a monologue and retell what you have heard.")
-            self._set_tts_callback(self._next_partC_step)
-            self._start_tts("Part C Retelling. In this part, you are required to listen to a monologue and retell what you have heard.", self.signal_tts_next)
+            self._play_prompt_audio("PartC-Intro", self._next_partC_step)
         elif s == 1:
             text = f"梗概：{self.pkg.partC_summary}\n关键词：{self.pkg.partC_keywords}"
             self.signal_update_display.emit("阅读梗概和关键词", text)
@@ -2303,33 +2595,19 @@ class PracticePage(QWidget):
                     QMessageBox.warning(self, "警告", "Part C 音频文件不存在")
                     self._next_partC_step()
         elif s == 3:
-            self._set_timer(1, self._next_partC_step)
+            self._set_timer(5, self._next_partC_step)
         elif s == 5:
             self.signal_update_display.emit("准备复述 (60秒)", "")
             self._set_timer(60)
         elif s == 6:
-            if replay:
-                # 重进 / 上一步 落到复述录音点：先重播独白（题目），再开始录音
-                text = f"梗概：{self.pkg.partC_summary}\n关键词：{self.pkg.partC_keywords}"
-                self.signal_update_display.emit("听独白", text)
-                if self.pkg.partC_source_type == "tts":
-                    self._set_tts_callback(lambda: self._begin_c_record())
-                    self._start_tts(self.pkg.partC_tts_text, self.signal_tts_next)
-                else:
-                    if self.pkg.partC_audio_path and os.path.exists(self.pkg.partC_audio_path):
-                        self._audio_callback = lambda: self._begin_c_record()
-                        media = self.vlc_instance.media_new(self.pkg.partC_audio_path)
-                        self.player.set_media(media)
-                        self.player.play()
-                        self.display_stack.setCurrentWidget(self.text_display)
-                        QTimer.singleShot(80, lambda: self._delayed_set_volume(100))
-                    else:
-                        QMessageBox.warning(self, "警告", "Part C 音频文件不存在")
-                        self._begin_c_record()
-            else:
-                self.signal_update_display.emit("请复述故事", "")
-                self._start_recording()
-                self._set_timer(120)
+            # 复述前提示：播"现在开始复述"官方录音（pre 页）
+            self.signal_update_display.emit("录音准备",
+                "请用你自己的话复述刚才听到的故事。\nRetell the story in your own words.")
+            self._play_prompt_audio("PartC", self._next_partC_step)
+        elif s == 7:
+            # 复述录音：滴声 → 开始录音（record 页，截图2）
+            self.signal_update_display.emit("请复述故事", "")
+            self._play_beep(self._begin_c_record_now)
         else:
             self._stop_recording()
             self.session.partC_recording = self._save_recording("PartC")
@@ -2352,11 +2630,15 @@ class PracticePage(QWidget):
         self._c_step += 1
         self._exec_partC_step()
 
-    def _begin_c_record(self):
-        """进入 Part C 复述录音（开始录音并计时 120 秒）。"""
+    def _begin_c_record_now(self):
+        """Part C 滴声结束后实际开始复述录音（120 秒）。"""
         self.signal_update_display.emit("请复述故事", "")
         self._start_recording()
         self._set_timer(120)
+
+    def _begin_c_record(self):
+        """兼容入口：直接开始 Part C 复述录音（无提示音/滴声）。"""
+        self._begin_c_record_now()
 
     # ---------- 计时器 ----------
     def _set_timer(self, seconds, callback=None):
@@ -2410,29 +2692,19 @@ class PracticePage(QWidget):
                 return ("partB", step + 1)
             return ("partC", 0)
         if phase == "partC":
-            if step < 6:
+            if step < 7:
                 return ("partC", step + 1)
             return None
         return None
 
     def _prev_checkpoint(self, phase, step):
-        """返回上一个「机读 / 录音 / 环节」点——只后退一步。"""
-        if phase == "partA":
-            if step > 0:
-                return ("partA", step - 1)
-            return None
-        if phase == "partB":
-            if step > 0:
-                return ("partB", step - 1)
-            return ("partA", 6)
-        if phase == "partC":
-            if step > 0:
-                return ("partC", step - 1)
-            moments = getattr(self, "_b_moments", None)
-            if moments:
-                return ("partB", len(moments) - 1)
-            return ("partB", 0)
-        return None
+        """返回上一个检查点——用 H 列（_PREV_CHECKPOINTS）往上找最近的 ●。
+
+        规则（来自 Excel 列 H「上一步落点」）：
+          ↑ = 跳到往上最近的 ● 标记页
+          无 = 录音中，不可上一步
+        """
+        return self._find_prev_checkpoint(self._PREV_CHECKPOINTS, phase, step)
 
     def _go_to_checkpoint(self, cp, replay=False):
         phase, step = cp
@@ -2521,20 +2793,28 @@ class PracticePage(QWidget):
                 self.player.audio_set_volume(100)
                 self._run_part_a()
                 return
-            nxt = self._next_checkpoint(self._current_phase, self._cur_step())
-            if nxt is None:
-                # 已是最后一个录音点，结束考试（当前录音已在清理时保存）
+            # 按 Excel 第 9 列「跳过/结束录音」落点表前进
+            target = self._SKIP_NEXT.get((self._current_phase, self._cur_step()))
+            if target is None:
+                # 兜底：沿用旧逻辑前进一步
+                target = self._next_checkpoint(self._current_phase, self._cur_step())
+            if target is None or target == "FINISH":
+                # 已是最后一页（C-record 结束录音批改），结束考试
+                # 当前录音已在 _cleanup_for_nav 中保存
                 self.signal_finished.emit()
                 return
-            self._go_to_checkpoint(nxt)
+            self._go_to_checkpoint(target)
         finally:
             self._navigating = False
 
     def _prev_current(self):
-        """上一步：跳到上一个录音点重新录音（0.4s 缓冲，不显示）。仅练习模式可用。"""
+        """上一步：跳到上一个检查点重新开始。仅练习模式可用。
+        准备阶段/录音中不可用（按钮已置灰，此处为守卫）。"""
         if self.mode != "practice":
             return
         if self._current_phase not in ("partA", "partB", "partC"):
+            return
+        if getattr(self, "_is_recording", False):
             return
         if self._navigating:
             return
@@ -2679,6 +2959,7 @@ class PracticePage(QWidget):
         self._audio_frames = []
         self._is_recording = True
         self._update_skip_label()  # 录音开始：跳过按钮变为「结束录音」
+        self._update_nav_buttons()  # 刷新可用态：录音中跳过按钮=结束录音，需可点
         def callback(indata, frames, time_info, status):
             if self._is_recording:
                 self._audio_frames.append(indata.copy())
@@ -2694,6 +2975,7 @@ class PracticePage(QWidget):
     def _stop_recording(self):
         self._is_recording = False
         self._update_skip_label()  # 录音结束：按钮恢复为「跳过」
+        self._update_nav_buttons()  # 刷新可用态
         if self._stream:
             self._stream.stop()
             self._stream.close()
