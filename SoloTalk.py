@@ -1863,14 +1863,14 @@ class PracticePage(QWidget):
     _PREV_CHECKPOINTS = [
         ("partA", 0,  "A-intro"),         # R2
         ("partA", 6,  "A-recordPrep"),    # R8  ← 比 G 多此行！
-        ("partB", 4,  "B-prepQ1"),        # R14 (b_step=4, prep_q idx=0)
-        ("partB", 7,  "B-prepQ2"),        # R17 (b_step=7, prep_q idx=1)
-        ("partB", 10, "B-prepQ3"),        # R20 (b_step=10, prep_q idx=2)
-        ("partB", 14, "B-hearQ1"),        # R24 (b_step=14, hear_q idx=0)
-        ("partB", 18, "B-hearQ2"),        # R28 (b_step=18, hear_q idx=1)
-        ("partB", 22, "B-hearQ3"),        # R32 (b_step=22, hear_q idx=2)
-        ("partB", 26, "B-hearQ4"),        # R36 (b_step=26, hear_q idx=3)
-        ("partB", 30, "B-hearQ5"),        # R40 (b_step=30, hear_q idx=4)
+        ("partB", 4,  "B-prepQ1"),        # R14 (b_step=4,  prep_q idx=0)
+        ("partB", 9,  "B-prepQ2"),        # R17 (b_step=9,  prep_q idx=1)
+        ("partB", 14, "B-prepQ3"),        # R20 (b_step=14, prep_q idx=2)
+        ("partB", 20, "B-hearQ1"),        # R24 (b_step=20, hear_q idx=0)
+        ("partB", 24, "B-hearQ2"),        # R28 (b_step=24, hear_q idx=1)
+        ("partB", 28, "B-hearQ3"),        # R32 (b_step=28, hear_q idx=2)
+        ("partB", 32, "B-hearQ4"),        # R36 (b_step=32, hear_q idx=3)
+        ("partB", 36, "B-hearQ5"),        # R40 (b_step=36, hear_q idx=4)
         ("partC", 0,  "C-intro"),         # R44
     ]
 
@@ -1879,13 +1879,13 @@ class PracticePage(QWidget):
         ("partA", 0,  "A-intro"),         # R2
         ("partB", 0,  "B-intro"),          # R10 ← H 表没有此行（B-intro 的 ↑ 跳到 A-recordPrep）
         ("partB", 4,  "B-prepQ1"),        # R14
-        ("partB", 7,  "B-prepQ2"),        # R17
-        ("partB", 10, "B-prepQ3"),        # R20
-        ("partB", 14, "B-hearQ1"),        # R24
-        ("partB", 18, "B-hearQ2"),        # R28
-        ("partB", 22, "B-hearQ3"),        # R32
-        ("partB", 26, "B-hearQ4"),        # R36
-        ("partB", 30, "B-hearQ5"),        # R40
+        ("partB", 9,  "B-prepQ2"),        # R17
+        ("partB", 14, "B-prepQ3"),        # R20
+        ("partB", 20, "B-hearQ1"),        # R24
+        ("partB", 24, "B-hearQ2"),        # R28
+        ("partB", 28, "B-hearQ3"),        # R32
+        ("partB", 32, "B-hearQ4"),        # R36
+        ("partB", 36, "B-hearQ5"),        # R40
         ("partC", 0,  "C-intro"),         # R44
     ]
 
@@ -1905,40 +1905,46 @@ class PracticePage(QWidget):
         ("partA", 6): ("partA", 7),   # A-recordPrep-> A-record
         ("partA", 7): ("partB", 0),   # A-record    -> 结束录音跳B-intro
         # ---- Part B ----
-        ("partB", 0): ("partB", 1),   # B-intro     -> B-situation
-        ("partB", 1): ("partB", 2),   # B-situation -> B-listen
-        ("partB", 2): ("partB", 3),   # B-listen    -> B-askGuide
-        ("partB", 3): ("partB", 4),   # B-askGuide  -> B-prepQ1
-        ("partB", 4): ("partB", 5),   # B-prepQ1    -> B-recQ1
-        ("partB", 5): ("partB", 6),   # B-recQ1     -> 结束录音跳B-ans1
-        ("partB", 6): ("partB", 7),   # B-ans1      -> B-prepQ2
-        ("partB", 7): ("partB", 8),   # B-prepQ2    -> B-recQ2
-        ("partB", 8): ("partB", 9),   # B-recQ2     -> 结束录音跳B-ans2
-        ("partB", 9): ("partB", 10),  # B-ans2      -> B-prepQ3
-        ("partB", 10): ("partB", 11), # B-prepQ3    -> B-recQ3
-        ("partB", 11): ("partB", 12), # B-recQ3     -> 结束录音跳B-ans3
-        ("partB", 12): ("partB", 13), # B-ans3      -> B-ansGuide
-        ("partB", 13): ("partB", 14), # B-ansGuide  -> B-hearQ1
-        ("partB", 14): ("partB", 15), # B-hearQ1    -> B-repeatQ1
-        ("partB", 15): ("partB", 16), # B-repeatQ1  -> B-prepA1
-        ("partB", 16): ("partB", 17), # B-prepA1    -> B-recA1
-        ("partB", 17): ("partB", 18), # B-recA1     -> 结束录音跳B-hearQ2
-        ("partB", 18): ("partB", 19), # B-hearQ2    -> B-repeatQ2
-        ("partB", 19): ("partB", 20), # B-repeatQ2  -> B-prepA2
-        ("partB", 20): ("partB", 21), # B-prepA2    -> B-recA2
-        ("partB", 21): ("partB", 22), # B-recA2     -> 结束录音跳B-hearQ3
-        ("partB", 22): ("partB", 23), # B-hearQ3    -> B-repeatQ3
-        ("partB", 23): ("partB", 24), # B-repeatQ3  -> B-prepA3
-        ("partB", 24): ("partB", 25), # B-prepA3    -> B-recA3
-        ("partB", 25): ("partB", 26), # B-recA3     -> 结束录音跳B-hearQ4
-        ("partB", 26): ("partB", 27), # B-hearQ4    -> B-repeatQ4
-        ("partB", 27): ("partB", 28), # B-repeatQ4  -> B-prepA4
-        ("partB", 28): ("partB", 29), # B-prepA4    -> B-recA4
-        ("partB", 29): ("partB", 30), # B-recA4     -> 结束录音跳B-hearQ5
-        ("partB", 30): ("partB", 31), # B-hearQ5    -> B-repeatQ5
-        ("partB", 31): ("partB", 32), # B-repeatQ5  -> B-prepA5
-        ("partB", 32): ("partB", 33), # B-prepA5    -> B-recA5
-        ("partB", 33): ("partC", 0),  # B-recA5     -> 结束录音跳C-intro
+        ("partB", 0): ("partB", 1),   # B-intro       -> B-situation
+        ("partB", 1): ("partB", 2),   # B-situation  -> B-listen
+        ("partB", 2): ("partB", 3),   # B-listen     -> B-askGuide
+        ("partB", 3): ("partB", 4),   # B-askGuide   -> B-prepQ1
+        ("partB", 4): ("partB", 5),   # B-prepQ1     -> B-recQ1
+        ("partB", 5): ("partB", 6),   # B-recQ1      -> 结束录音跳B-ans1(播)
+        ("partB", 6): ("partB", 7),   # B-ans1(播)   -> B-ans1(gap)
+        ("partB", 7): ("partB", 8),   # B-ans1(gap)  -> B-ans1(重播)
+        ("partB", 8): ("partB", 9),   # B-ans1(重播) -> B-prepQ2
+        ("partB", 9): ("partB", 10),  # B-prepQ2     -> B-recQ2
+        ("partB", 10): ("partB", 11), # B-recQ2      -> 结束录音跳B-ans2(播)
+        ("partB", 11): ("partB", 12), # B-ans2(播)   -> B-ans2(gap)
+        ("partB", 12): ("partB", 13), # B-ans2(gap)  -> B-ans2(重播)
+        ("partB", 13): ("partB", 14), # B-ans2(重播) -> B-prepQ3
+        ("partB", 14): ("partB", 15), # B-prepQ3     -> B-recQ3
+        ("partB", 15): ("partB", 16), # B-recQ3      -> 结束录音跳B-ans3(播)
+        ("partB", 16): ("partB", 17), # B-ans3(播)   -> B-ans3(gap)
+        ("partB", 17): ("partB", 18), # B-ans3(gap)  -> B-ans3(重播)
+        ("partB", 18): ("partB", 19), # B-ans3(重播) -> B-ansGuide
+        ("partB", 19): ("partB", 20), # B-ansGuide   -> B-hearQ1(听1)
+        ("partB", 20): ("partB", 21), # B-hearQ1(听1)-> B-hearQ1(听2)
+        ("partB", 21): ("partB", 22), # B-hearQ1(听2)-> B-hearQ1(计时)
+        ("partB", 22): ("partB", 23), # B-hearQ1(计时)-> B-recA1
+        ("partB", 23): ("partB", 24), # B-recA1      -> 结束录音跳B-hearQ2(听1)
+        ("partB", 24): ("partB", 25), # B-hearQ2(听1)-> B-hearQ2(听2)
+        ("partB", 25): ("partB", 26), # B-hearQ2(听2)-> B-hearQ2(计时)
+        ("partB", 26): ("partB", 27), # B-hearQ2(计时)-> B-recA2
+        ("partB", 27): ("partB", 28), # B-recA2      -> 结束录音跳B-hearQ3(听1)
+        ("partB", 28): ("partB", 29), # B-hearQ3(听1)-> B-hearQ3(听2)
+        ("partB", 29): ("partB", 30), # B-hearQ3(听2)-> B-hearQ3(计时)
+        ("partB", 30): ("partB", 31), # B-hearQ3(计时)-> B-recA3
+        ("partB", 31): ("partB", 32), # B-recA3      -> 结束录音跳B-hearQ4(听1)
+        ("partB", 32): ("partB", 33), # B-hearQ4(听1)-> B-hearQ4(听2)
+        ("partB", 33): ("partB", 34), # B-hearQ4(听2)-> B-hearQ4(计时)
+        ("partB", 34): ("partB", 35), # B-hearQ4(计时)-> B-recA4
+        ("partB", 35): ("partB", 36), # B-recA4      -> 结束录音跳B-hearQ5(听1)
+        ("partB", 36): ("partB", 37), # B-hearQ5(听1)-> B-hearQ5(听2)
+        ("partB", 37): ("partB", 38), # B-hearQ5(听2)-> B-hearQ5(计时)
+        ("partB", 38): ("partB", 39), # B-hearQ5(计时)-> B-recA5
+        ("partB", 39): ("partC", 0),  # B-recA5      -> 结束录音跳C-intro
         # ---- Part C ----
         ("partC", 0): ("partC", 1),   # C-intro     -> C-keywords
         ("partC", 1): ("partC", 2),   # C-keywords  -> C-monologue1
@@ -2452,8 +2458,12 @@ class PracticePage(QWidget):
             self._b_moments.append({"t": "prep_q", "idx": idx, "main": f"准备提问 {idx+1}", "sub": q['cn_prompt']})
             # 提问录音：先播滴声再开始录音
             self._b_moments.append({"t": "record_q", "idx": idx, "main": f"请提问 {idx+1}", "sub": q['cn_prompt']})
-            self._b_moments.append({"t": "tts", "main": "电脑回答", "sub": "", "text": q['en_answer'],
-                                    "audio": q.get('en_audio')})
+            # 电脑回答：仿 C 拆成「播→过渡gap(5s)→重播」三页（与 C-monologue1/gap/monologue2 一致）
+            self._b_moments.append({"t": "tts", "main": "电脑回答", "sub": "",
+                                    "text": q['en_answer'], "audio": q.get('en_audio')})
+            self._b_moments.append({"t": "timer", "sec": 5, "main": "电脑回答", "sub": ""})  # 静音gap：显示保持与上一页(电脑回答)一致，不显示(过渡)
+            self._b_moments.append({"t": "tts", "main": "电脑回答", "sub": "",
+                                    "text": q['en_answer'], "audio": q.get('en_audio')})
         # 回答引导 — 播放官方录音（对整段回答的总引导）
         self._b_moments.append({"t": "prompt", "main": "回答引导",
                                 "sub": "下面你用英语回答五个问题。\nPlease get ready to answer five questions in English.",
