@@ -1,0 +1,12 @@
+{
+  "desktop": {
+    "version": "2.0",
+    "notes": "2.0：电脑回答改为「播 → 静音 5s → 重播」三页；新增「检查更新」提示（仅提示，不自动下载）；修复录音界面显示。请前往发布页下载最新安装包。",
+    "url": "https://github.com/OWNER/SoloTalk/releases/tag/v2.0-desktop"
+  },
+  "mobile": {
+    "version": "2.0",
+    "notes": "2.0：与电脑版同步——电脑回答三页拆分、新增「检查更新」提示、录音界面修复等。请前往应用商店/发布页更新。",
+    "url": "https://github.com/OWNER/SoloTalk/releases/tag/v2.0-mobile"
+  }
+}
