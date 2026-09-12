@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-SoloTalk 1.8 — 单机版听说模考编辑器
-依赖安装：pip install PyQt5 pyttsx3 sounddevice vosk python-vlc numpy scipy fastembed edge-tts
+SoloTalk 2.1 — 单机版听说模考编辑器
+依赖安装：pip install PyQt5 pyttsx3 sounddevice vosk python-vlc numpy fastembed edge-tts
 （edge-tts 为高质量神经语音，需联网；未安装或断网时自动回退系统 SAPI5 语音）
 所有控制台输出（print / 异常栈 / 崩溃栈）都会同步写入 _solo_diag.log（打包后写用户主目录），方便无控制台环境排查。
 
@@ -31,7 +31,7 @@ import time
 import threading
 import ctypes
 from pathlib import Path
-
+import urllib.request
 # 确保 VLC 可被找到（双击运行时工作目录可能不在脚本同级）
 # 打包后支持 one-folder 与 one-file 两种模式：
 #  - one-folder：exe 与 VLC/ 并排，取 exe 所在目录
@@ -72,7 +72,7 @@ if sys.platform == "win32":
         except Exception:
             pass
         # 注意：不将 _INTERNAL_DIR 加入 os.add_dll_directory！
-        # _internal/ 包含大量其他包的 DLL（PyQt5、numpy、scipy），可能与 onnxruntime
+        # _internal/ 包含大量其他包的 DLL（PyQt5、numpy），可能与 onnxruntime
         # 产生 CRT 版本冲突。只添加 onnxruntime 自己的目录。
         _ort_dll_dir = os.path.join(_INTERNAL_DIR, "onnxruntime", "capi")
         if os.path.isdir(_ort_dll_dir):
@@ -298,8 +298,10 @@ if sys.platform == "win32":
 import pyttsx3
 import sounddevice as sd
 import numpy as np
-from scipy.io import wavfile as wav_write
 import vlc
+
+# 注：录音写盘用标准库 wave（等价 scipy.io.wavfile.write），避免仅为这一个函数引入
+#     scipy 及其 OpenBLAS 依赖（约 70MB 打包体积）。录音固定 int16 / 单声道 / 16kHz。
 
 # ---------- BGE 嵌入模型（Part B/C 语义相似度，可选） ----------
 _BGE_MODEL_DIR = _resolve_model_dir("bge-small-en-v1.5")
@@ -506,6 +508,38 @@ RECORDINGS_DIR = "recordings"
 HISTORY_DIR = "history"
 SAMPLE_RATE = 16000
 TTS_TIMEOUT = 30
+
+# 用户偏好（是否在启动时自动检查更新）；存 JSON，失败一律静默降级为默认值
+SETTINGS_FILE = "solotalk_settings.json"
+
+
+def _load_settings():
+    """读取偏好设置；文件不存在/损坏时返回 {}（调用方用默认值）。"""
+    try:
+        path = _resolve_resource_file(SETTINGS_FILE) or SETTINGS_FILE
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"[SETTINGS] 读取失败，使用默认值: {e}")
+    return {}
+
+
+def _save_settings(data):
+    """写入偏好设置（写在程序同级的可写位置）；失败静默，不影响使用。"""
+    try:
+        if getattr(sys, "frozen", False):
+            path = os.path.join(_BASE_DIR, SETTINGS_FILE)
+        else:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"[SETTINGS] 保存失败: {e}")
+        return False
 
 # ------------------ TTS 工具（每次创建独立引擎）------------------
 # 优先使用 edge-tts（微软神经网络语音，自然、有停顿、听得清）；
@@ -838,7 +872,7 @@ class SoloPackage:
     def __init__(self):
         self.meta = {
             "name": "Untitled",
-            "version": "1.8",
+            "version": "2.1",
             "created": datetime.datetime.now().isoformat(),
             "author": "",
             "anonymous": False
@@ -928,7 +962,7 @@ class PracticeSession:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SoloTalk 1.8 - 单机版听说模考编辑器")
+        self.setWindowTitle(f"SoloTalk {APP_VERSION} - 单机版听说模考编辑器")
         self.setMinimumSize(1024, 700)
 
         # 窗口图标（打包后图标可能在 _internal/ 下）
@@ -940,6 +974,8 @@ class MainWindow(QMainWindow):
 
         self.current_package = SoloPackage()
         self.current_session = None
+        # 用户偏好（目前只有「启动时自动检查更新」）
+        self.settings = _load_settings()
 
         self.central = QStackedWidget()
         self.setCentralWidget(self.central)
@@ -948,15 +984,32 @@ class MainWindow(QMainWindow):
         self.editor_page = EditorPage(self)
         self.practice_page = PracticePage(self)
         self.history_page = HistoryPage(self)
+        self.more_page = MorePage(self)
 
         self.central.addWidget(self.home_page)
         self.central.addWidget(self.editor_page)
         self.central.addWidget(self.practice_page)
         self.central.addWidget(self.history_page)
+        self.central.addWidget(self.more_page)
         self.central.setCurrentWidget(self.home_page)
+
+        # 启动后静默检查更新（后台线程，不阻塞 UI）；仅提示，不自动下载
+        # 可在「更多 → 更新&下载地址」取消勾选「启动时自动检查更新」
+        if self.settings.get("auto_check_update", True):
+            QTimer.singleShot(1500, self._check_update)
+        else:
+            print("[UPDATE] 已按用户设置跳过启动自动检查更新")
+
         self.show()
 
     def go_to(self, page):
+        # 保险：离开练习页面前，先彻底停止视频并解绑嵌入窗口。
+        # 否则承载 VLC 视频的原生窗口可能残留在其它页面之上，导致「未响应」/点击穿透。
+        try:
+            if page is not self.practice_page and self.central.currentWidget() is self.practice_page:
+                self.practice_page._stop_video()
+        except Exception:
+            pass
         self.central.setCurrentWidget(page)
 
     def closeEvent(self, event):
@@ -967,16 +1020,63 @@ class MainWindow(QMainWindow):
                 return
         event.accept()
 
+    def _check_update(self):
+        """后台检查更新；有新版时弹出提示对话框（不自动下载/安装）。"""
+        if getattr(self, "_updater", None) and self._updater.isRunning():
+            return  # 避免重复触发
+        self._updater = UpdateChecker()
+        self._updater.update_available.connect(self.show_update_dialog)
+        self._updater.start()
+
+    def show_update_dialog(self, info):
+        """展示「发现新版本」对话框，提供前往下载链接（外部浏览器打开）。"""
+        print(f"[UPDATE] 弹出更新提示对话框（新版本 {info.get('version', '')}）")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("发现新版本")
+        # 去掉标题栏右上角的 "?"（Qt 默认的上下文帮助按钮）
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dlg.setMinimumWidth(440)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"<b>发现新版本 SoloTalk {info.get('version', '')}</b>"))
+        notes = info.get("notes", "")
+        if notes:
+            tb = QTextEdit(notes)
+            tb.setReadOnly(True)
+            tb.setMaximumHeight(180)
+            layout.addWidget(tb)
+
+        def _go():
+            url = info.get("url", "")
+            if url:
+                print(f"[UPDATE] 用户点击「前往下载」，打开: {url}")
+                QDesktopServices.openUrl(QUrl(url))
+            dlg.accept()
+
+        btn_later = QPushButton("稍后提醒")
+        btn_open = QPushButton("前往下载")
+        btn_open.setStyleSheet("background:#3498db;color:white;font-weight:bold;")
+        btn_later.clicked.connect(
+            lambda: (print("[UPDATE] 用户选择「稍后提醒」"), dlg.reject())
+        )
+        btn_open.clicked.connect(_go)
+        box = QHBoxLayout()
+        box.addStretch(1)
+        box.addWidget(btn_later)
+        box.addWidget(btn_open)
+        layout.addLayout(box)
+        dlg.exec_()
+
 class HomePage(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main = main_window
         layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignCenter)
+        layout.setContentsMargins(24, 24, 24, 18)
+        layout.addStretch(1)   # 主体内容整体垂直居中，底部再留出「更多」入口
         title = QLabel("SoloTalk")
         title.setStyleSheet("font-size:42px; font-weight:bold; color:#2c3e50;")
         title.setAlignment(Qt.AlignCenter)
-        subtitle = QLabel("单机版英语听说模考编辑器 · 完全离线")
+        subtitle = QLabel("单机版英语听说模考编辑器 · 完全免费")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet("font-size:16px; color:#7f8c8d; margin-bottom:30px;")
         layout.addWidget(title)
@@ -1008,6 +1108,22 @@ class HomePage(QWidget):
         layout.addWidget(btn_exam, alignment=Qt.AlignCenter)
         layout.addSpacing(20)
         layout.addWidget(btn_history, alignment=Qt.AlignCenter)
+        layout.addStretch(1)
+
+        # 左下角「更多」入口：作者介绍 / 更新 / 意见反馈 / 版本信息
+        bottom = QHBoxLayout()
+        btn_more = QPushButton("⋯  更多")
+        btn_more.setCursor(Qt.PointingHandCursor)
+        btn_more.setToolTip("作者介绍 / 更新 / 意见反馈 / 版本信息")
+        btn_more.setStyleSheet(
+            "QPushButton { font-size:14px; padding:8px 18px; border:1px solid #cfd8dc;"
+            " border-radius:8px; background:white; color:#607d8b; }"
+            "QPushButton:hover { background:#ecf0f1; color:#2c3e50; }"
+        )
+        btn_more.clicked.connect(lambda: self.main.go_to(self.main.more_page))
+        bottom.addWidget(btn_more)
+        bottom.addStretch(1)
+        layout.addLayout(bottom)
         self.setLayout(layout)
 
     def load_and_start(self, mode):
@@ -1030,6 +1146,459 @@ class HomePage(QWidget):
             self.main.practice_page._check_and_prompt_progress()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载失败：{str(e)}")
+
+# ------------------ 更多（左侧导航 + 右侧单栏内容） ------------------
+class MorePage(QWidget):
+    """首页左下角「更多」入口对应的页面。
+
+    布局参考常见设置页：左侧导航列出各板块，右侧**只显示当前选中的那一项**，
+    右上角提供「返回主页」。避免所有内容堆在一页里。
+    """
+
+    # 外链集中在此，日后改地址只改这一处
+    REPO_URL = "https://github.com/FallingLighty/SoloTalk"
+    RELEASES_URL = "https://github.com/FallingLighty/SoloTalk/releases"
+    BILIBILI_URL = "https://space.bilibili.com/1667914290"
+    QQ_JOIN_URL = "https://qm.qq.com/q/o4Yfw2jsDm"
+    DOWNLOAD_URL = "https://github.com/FallingLighty/SoloTalk/releases/latest"
+    LABEL_W = 96   # 「下载地址：」这类行标签的固定宽度（保证冒号对齐）
+    QQ_GROUP_NO = "1091799764"
+    QR_FILENAME = "qq_group_qr.jpg"
+    ICON_FILENAME = "xixi.ico"
+
+    NAV_ITEMS = [
+        ("ℹ️", "关于"),
+        ("⬆️", "更新&下载地址"),
+        ("💬", "意见反馈"),
+        ("📌", "使用须知&声明"),
+    ]
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main = main_window
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ---------- 左侧：导航栏 + 底部版本信息 ----------
+        left = QFrame()
+        left.setObjectName("moreSide")
+        left.setFixedWidth(188)
+        left.setStyleSheet(
+            "QFrame#moreSide { background:#f7f9fb; border:none;"
+            " border-right:1px solid #e6ebef; }"
+        )
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(0)
+
+        self.nav = QListWidget()
+        self.nav.setFrameShape(QFrame.NoFrame)
+        self.nav.setStyleSheet(
+            "QListWidget { background:transparent; border:none; outline:none; padding:10px 0; }"
+            "QListWidget::item { height:44px; margin:2px 10px; border-radius:8px;"
+            " color:#55606b; font-size:14px; }"
+            "QListWidget::item:hover { background:#edf1f4; }"
+            "QListWidget::item:selected { background:#e4eff9; color:#1f6fb2; }"
+        )
+        for icon, name in self.NAV_ITEMS:
+            item = QListWidgetItem(f"  {icon}    {name}")
+            item.setSizeHint(QSize(0, 44))
+            self.nav.addItem(item)
+        self.nav.currentRowChanged.connect(self._on_nav)
+        lv.addWidget(self.nav, 1)
+
+        # 底部分隔线 + 「返回主页」按钮（左下角，不再放右上角）
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background:#e6ebef;")
+        sep_row = QHBoxLayout()
+        sep_row.setContentsMargins(18, 0, 18, 0)
+        sep_row.addWidget(sep)
+        lv.addLayout(sep_row)
+
+        foot = QWidget()
+        fv = QVBoxLayout(foot)
+        fv.setContentsMargins(18, 12, 18, 16)
+        fv.setSpacing(0)
+        btn_back = QPushButton("返回主页")
+        btn_back.setCursor(Qt.PointingHandCursor)
+        btn_back.setStyleSheet(
+            "QPushButton { font-size:13px; padding:7px 0; border:1px solid #cfd8dc;"
+            " border-radius:8px; background:white; color:#55606b; }"
+            "QPushButton:hover { background:#f4f7f9; color:#2c3e50; }"
+        )
+        btn_back.clicked.connect(lambda: self.main.go_to(self.main.home_page))
+        fv.addWidget(btn_back)
+        lv.addWidget(foot)
+
+        root.addWidget(left)
+
+        # ---------- 右侧：内容栈（返回按钮已移到左下角） ----------
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(26, 22, 26, 20)
+        rv.setSpacing(10)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._scroll(self._page_about()))
+        self.stack.addWidget(self._scroll(self._page_update()))
+        self.stack.addWidget(self._scroll(self._page_feedback()))
+        self.stack.addWidget(self._scroll(self._page_terms()))
+        rv.addWidget(self.stack, 1)
+        root.addWidget(right, 1)
+
+        self.nav.setCurrentRow(0)
+        self.setLayout(root)
+
+    def _on_nav(self, row):
+        """侧栏切换 → 右侧只显示对应板块。"""
+        if 0 <= row < self.stack.count():
+            self.stack.setCurrentIndex(row)
+
+    # ---------- 通用小组件 ----------
+    def _page(self):
+        """返回 (容器控件, 垂直布局)；内容顶部对齐。"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(2, 2, 2, 2)
+        v.setSpacing(12)
+        v.setAlignment(Qt.AlignTop)
+        return w, v
+
+    def _scroll(self, inner):
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setWidget(inner)
+        return sc
+
+    def _heading(self, text, size=20):
+        lb = QLabel(text)
+        lb.setStyleSheet(f"font-size:{size}px; font-weight:bold; color:#2c3e50;")
+        return lb
+
+    def _sub(self, text, size=20):
+        """小节标题（带左侧强调竖线），用于长文分块。
+
+        字号与页面大标题一致（20px 加粗）——原来还有一级更大的页面标题压在上面，
+        删掉之后小节就是最高层，所以统一到同一字号，各小节之间不再有大小差别。
+        """
+        lb = QLabel(f"<span style='color:#3498db;'>▍</span>{text}")
+        lb.setWordWrap(True)
+        lb.setTextFormat(Qt.RichText)
+        lb.setStyleSheet(f"font-size:{size}px; font-weight:bold; color:#2c3e50;")
+        return lb
+
+    def _para(self, text, size=14, color="#4a5560"):
+        lb = QLabel(text)
+        lb.setWordWrap(True)
+        lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lb.setStyleSheet(f"font-size:{size}px; color:{color};")
+        return lb
+
+    def _primary_btn(self, label, slot):
+        btn = QPushButton(label)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton { font-size:14px; padding:8px 22px; border:none; border-radius:8px;"
+            " background:#3498db; color:white; font-weight:bold; }"
+            "QPushButton:hover { background:#2980b9; }"
+        )
+        btn.clicked.connect(slot)
+        return btn
+
+    def _link_row(self, links, center=False):
+        """一行「A · B · C」样式的文字链接。"""
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        if center:
+            row.addStretch(1)
+        for i, (label, url) in enumerate(links):
+            if i:
+                sep = QLabel("·")
+                sep.setStyleSheet("color:#b8c2cc; font-size:14px;")
+                row.addWidget(sep)
+            btn = QPushButton(label)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFlat(True)
+            btn.setStyleSheet(
+                "QPushButton { border:none; background:transparent; color:#3498db;"
+                " font-size:14px; padding:2px 6px; }"
+                "QPushButton:hover { color:#2980b9; }"
+            )
+            btn.clicked.connect(lambda _=False, u=url: QDesktopServices.openUrl(QUrl(u)))
+            row.addWidget(btn)
+        if center:
+            row.addStretch(1)
+        return row
+
+    def _info_value(self, value):
+        """只读输入框：内容可选中复制，样式跟页面一致（无焦点框抢眼）。"""
+        ed = QLineEdit(value)
+        ed.setReadOnly(True)
+        ed.setCursorPosition(0)
+        ed.setStyleSheet(
+            "QLineEdit { font-size:13px; color:#4a5560; background:#ffffff;"
+            " border:1px solid #dfe5ea; border-radius:6px; padding:5px 10px;"
+            " selection-background-color:#cfe6f7; selection-color:#2c3e50; }"
+        )
+        return ed
+
+    def _secondary_btn(self, label, slot):
+        """白底描边次要按钮（点击率高时用 _primary_btn）。"""
+        btn = QPushButton(label)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton { font-size:13px; padding:5px 16px; border:1px solid #cfd8dc;"
+            " border-radius:6px; background:white; color:#55606b; }"
+            "QPushButton:hover { background:#f4f7f9; color:#2c3e50; }"
+        )
+        if slot is not None:
+            btn.clicked.connect(slot)
+        return btn
+
+    def _info_row(self, label, value=None, btn_label=None, slot=None,
+                  box_width=None, stretch_box=False, primary_btn=False):
+        """一行「标签：+ 只读内容框 / 按钮」。
+
+        value      → 只读输入框（可选中复制）
+        btn_label  → 按钮，primary_btn=True 时与「检查更新」同款（蓝色主按钮）
+        两者可同时给：先内容框、再按钮。
+        """
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        lb = QLabel(label)
+        lb.setFixedWidth(self.LABEL_W)
+        lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lb.setStyleSheet("font-size:14px; color:#55606b;")
+        row.addWidget(lb)
+
+        if value is not None:
+            ed = self._info_value(value)
+            if box_width:
+                ed.setFixedWidth(box_width)
+            row.addWidget(ed, 1 if stretch_box else 0)
+
+        if btn_label is not None:
+            if primary_btn:
+                row.addWidget(self._primary_btn(btn_label, slot))
+            else:
+                row.addWidget(self._secondary_btn(btn_label, slot))
+
+        if not stretch_box:
+            row.addStretch(1)
+        return row
+
+    # ---------- 各板块 ----------
+    def _page_about(self):
+        w, v = self._page()
+
+        icon_lb = QLabel()
+        icon_lb.setAlignment(Qt.AlignCenter)
+        _icon = _resolve_resource_file(self.ICON_FILENAME)
+        if _icon:
+            _pix = QIcon(_icon).pixmap(96, 96)
+            if not _pix.isNull():
+                icon_lb.setPixmap(_pix)
+        v.addWidget(icon_lb)
+
+        name = QLabel("SoloTalk")
+        name.setAlignment(Qt.AlignCenter)
+        name.setStyleSheet("font-size:26px; font-weight:bold; color:#2c3e50;")
+        v.addWidget(name)
+
+        ver = QLabel(f"v{APP_VERSION}")
+        ver.setAlignment(Qt.AlignCenter)
+        ver.setFixedWidth(66)
+        ver.setStyleSheet(
+            "font-size:13px; color:#55606b; background:#eef2f5;"
+            " border-radius:11px; padding:4px 0;"
+        )
+        ver_row = QHBoxLayout()
+        ver_row.addStretch(1)
+        ver_row.addWidget(ver)
+        ver_row.addStretch(1)
+        v.addLayout(ver_row)
+
+        desc = QLabel("单机版英语听说模考编辑器 · 完全免费 · 开源")
+        desc.setAlignment(Qt.AlignCenter)
+        desc.setStyleSheet("font-size:14px; color:#7f8c8d;")
+        v.addWidget(desc)
+
+        v.addLayout(self._link_row([
+            ("源码仓库", self.REPO_URL),
+            ("哔哩哔哩主页", self.BILIBILI_URL),
+            ("Github 发布页", self.RELEASES_URL),
+        ], center=True))
+
+        v.addSpacing(4)
+        v.addWidget(self._para("作者：晖落然（FallingLighty）、cheng、咸鱼", size=14))
+        v.addWidget(self._para(
+            "一款自制、免费、非商用、开源的英语听说软件，"
+            "可在没有 E 听说 E 卡的情况下提前体验高考听说考试流程。",
+            size=13, color="#7f8c8d"))
+
+        v.addStretch(1)
+        return w
+
+    def _page_update(self):
+        w, v = self._page()
+        v.addWidget(self._heading("版本更新"))
+        v.addWidget(self._para("仅提示新版本，不自动下载或替换；需要时前往发布页手动下载。",
+                               size=13, color="#7f8c8d"))
+
+        # 平铺文字，不加卡片外框
+        v.addWidget(self._para(f"当前版本：SoloTalk {APP_VERSION}", size=15))
+        v.addWidget(self._para(
+            f"运行平台：{'手机 / 安卓' if CHANNEL == 'mobile' else '电脑（Windows）'}", size=15))
+        v.addWidget(self._para(
+            "运行模式：模考（不可跳过 / 不可返回） / 练习（可跳过、可返回）", size=15))
+
+        # 检查更新（手动）+ 启动时是否自动检查
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        row.addWidget(self._primary_btn("检查更新", self.main._check_update))
+        self.chk_auto_update = QCheckBox("启动时自动检查更新")
+        self.chk_auto_update.setCursor(Qt.PointingHandCursor)
+        self.chk_auto_update.setChecked(bool(self.main.settings.get("auto_check_update", True)))
+        self.chk_auto_update.setStyleSheet("QCheckBox { font-size:13px; color:#55606b; }")
+        self.chk_auto_update.toggled.connect(self._on_auto_update_toggled)
+        row.addWidget(self.chk_auto_update)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        # ---- 下载地址：两种获取方式（进 QQ 群 / 发布页） ----
+        v.addSpacing(10)
+        v.addWidget(self._heading("下载地址"))
+        v.addLayout(self._info_row(
+            "QQ群：",
+            btn_label=f"点击加入群聊(QQ：{self.QQ_GROUP_NO})",
+            slot=lambda: QDesktopServices.openUrl(QUrl(self.QQ_JOIN_URL)),
+            primary_btn=True))
+        v.addLayout(self._info_row(
+            "发布页：",
+            btn_label="前往发布页",
+            slot=lambda: QDesktopServices.openUrl(QUrl(self.RELEASES_URL)),
+            primary_btn=True))
+
+        v.addStretch(1)
+        return w
+
+    def _page_feedback(self):
+        w, v = self._page()
+        v.addWidget(self._heading("意见反馈"))
+        v.addWidget(self._para("使用中遇到问题、或想提功能建议，欢迎进 QQ 群反馈。",
+                               size=13, color="#7f8c8d"))
+
+        v.addWidget(self._para("QQ 群：SoloTalkの创意工坊", size=15))
+        v.addWidget(self._para(f"群号：{self.QQ_GROUP_NO}", size=15, color="#7f8c8d"))
+        _join_row = QHBoxLayout()
+        _join_row.addWidget(self._primary_btn(
+            "点击加入群聊", lambda: QDesktopServices.openUrl(QUrl(self.QQ_JOIN_URL))))
+        _join_row.addStretch(1)
+        v.addLayout(_join_row)
+
+        qr_row = QHBoxLayout()
+        qr_row.addStretch(1)
+        _qr = _resolve_resource_file(self.QR_FILENAME)
+        if _qr:
+            _qrpix = QPixmap(_qr)
+            if not _qrpix.isNull():
+                pic = QLabel()
+                pic.setPixmap(_qrpix.scaledToWidth(210, Qt.SmoothTransformation))
+                qr_row.addWidget(pic)
+        else:
+            print(f"[MORE] 二维码资源未找到：{self.QR_FILENAME}（跳过显示，不影响其它内容）")
+        qr_row.addStretch(1)
+        v.addLayout(qr_row)
+
+        cap = QLabel(f"扫一扫，加入 QQ 交流群（群号 {self.QQ_GROUP_NO}）")
+        cap.setAlignment(Qt.AlignCenter)
+        cap.setStyleSheet("color:#95a5a6; font-size:13px;")
+        v.addWidget(cap)
+
+        v.addStretch(1)
+        return w
+
+    def _on_auto_update_toggled(self, checked):
+        """记住「启动时自动检查更新」的选择。"""
+        self.main.settings["auto_check_update"] = bool(checked)
+        _save_settings(self.main.settings)
+        print(f"[SETTINGS] 启动时自动检查更新 = {bool(checked)}")
+
+    def _page_terms(self):
+        """适用人群 / 使用须知 / 免责声明 三块合并在一页（侧栏只占一项）。
+
+        没有页面级大标题——侧栏「使用须知&声明」已经说明了本页主题，
+        正文直接由各小节标题（带左侧竖线）分段，层次更清楚。
+        """
+        w, v = self._page()
+
+        # ---- 联网说明（原来在「更新&下载地址」页，移到这里） ----
+        v.addWidget(self._sub("联网说明"))
+        v.addWidget(self._para(
+            "录音识别与批改全部在本地完成，断网也能完整考完；"
+            "联网时会自动启用更自然的在线朗读语音，并在启动时检查一次新版本"
+            "（可在「更新&下载地址」里关闭）。",
+            size=14))
+
+        # ---- 适用人群 ----
+        v.addWidget(self._sub("适用人群"))
+        for line in [
+            "1、想提前体验高考听说，但学校还未购买 E 听说 E 卡的学生",
+            "2、学校未强制，且用不上 E 听说复杂功能的学生",
+            "3、真的买不起 E 听说 E 卡的学生",
+        ]:
+            v.addWidget(self._para(line, size=14))
+        v.addWidget(self._para(
+            "注：本软件面向刚上高中、学校尚未统一购买 E 听说 E 卡的学生，"
+            "用于提前体验题型；不适合用于高三备考。",
+            size=13, color="#7f8c8d"))
+
+        # ---- 使用须知 ----
+        v.addSpacing(10)
+        v.addWidget(self._sub("使用须知"))
+        for line in [
+            "1、为保障题目原创权，题目署名一经保存不可更改，请慎重",
+            "2、Part C 要点请用英文逗号隔开，否则无法识别",
+            "3、手机版批改与历史记录功能尚不稳定，可能无法批改与回放录音，请做好预期",
+            "4、Part A 上传的视频需附带字幕",
+            "5、若手机麦克风无法识别，请自行在设置中开启软件麦克风使用权限",
+            "6、电脑版使用时不要关闭黑色弹窗",
+            "7、电脑版必须使用全英文路径",
+        ]:
+            v.addWidget(self._para(line, size=14))
+
+        # ---- 免责声明 ----
+        v.addSpacing(10)
+        v.addWidget(self._sub("免责声明"))
+        blocks = [
+            ("关于批改准确度",
+             "有人认为该软件不够科学、甚至可能误人子弟。的确，软件制作匆忙、又没有充足的数据，"
+             "批改可能存在不够准确的问题，但是还是可以参考的，体验一下流程。（可能A偏低，B偏高）"),
+            ("关于适用人群",
+             "因此本软件的使用人群可能限于刚上高中、学校还没购买会员、想体验一下高中题型的学生，"
+             "不适合用于高三备考。这一点此前没有在视频里明说，在此向各位表示抱歉。"),
+            ("关于题库",
+             "很感谢大家的支持。目前确实存在题目不足的问题，因为我们确实做不到 E 听说那样丰富的题库（但其实现在的数量已经可以了），"
+             "需要大家的共同创作——这也是QQ群建立的初衷。愿未来会有更加丰富的题库！"),
+            ("关于软件&试题",
+             "操作指南，软件和题目在群文件下载。"),
+            ("关于软件更新和问题",
+             "软件可能还有很多 bug，但 up 主本人就是一个即将上高三、也要考听说的学生，"
+             "能挤出时间完成这个软件已实属不易。我知道这有卖惨的嫌疑，但仍望大家见谅吧。"),
+        ]
+        for title, body in blocks:
+            v.addWidget(self._para(f"· {title}", size=14, color="#34495e"))
+            v.addWidget(self._para(body, size=14))
+            v.addSpacing(4)
+
+        v.addStretch(1)
+        return w
+
 
 # ------------------ 编辑模式 ------------------
 class EditorPage(QWidget):
@@ -1577,7 +2146,10 @@ class PracticePage(QWidget):
         return reply == QMessageBox.Yes
 
     def request_exit(self):
-        """返回 True 表示允许退出（已确认或无需确认）。"""
+        """返回 True 表示允许退出（已确认或无需确认）。
+
+        卡死的根因在 `_stop_video()`：VLC 未解除与 Qt 原生窗口的绑定就 stop() 会死锁。
+        这里不再额外暂停播放——VLC 的暂停/解绑/停止统一交给 `_stop_video()` 处理。"""
         if self._exam_active:
             if not self._confirm_abort():
                 return False
@@ -1593,7 +2165,7 @@ class PracticePage(QWidget):
         self._cancel_tts()
         if self._tts_thread and self._tts_thread.is_alive():
             self._tts_thread.join(timeout=0.5)
-        # 同步停止 VLC
+        # 同步停止 VLC（内部顺序：暂停 → 解绑嵌入窗口 → stop）
         self._stop_video()
         self.player.audio_set_volume(100)
         # 先把正在录的音保存下来，再把进度写入文件
@@ -1622,7 +2194,7 @@ class PracticePage(QWidget):
         self._audio_frames = []
         self.countdown_label.hide()
         self.recording_overlay.hide()
-        self.player.stop()
+        self._stop_video()
         self.display_stack.setCurrentWidget(self.text_display)
         self.main_label.setText("准备开始" + ("模考" if self.mode == "exam" else "练习"))
         self.sub_label.setText("")
@@ -2863,21 +3435,22 @@ class PracticePage(QWidget):
             return
         if show_window and self.display_stack.currentWidget() != self.video_container:
             self.display_stack.setCurrentWidget(self.video_container)
-        # 窗口句柄有效性检查：确保 video_frame 已创建且可见
+        # 始终把 VLC 绑定到 video_frame —— 即使该控件当前被隐藏（如 Part A「听录音」：
+        # 只想要声音、停留在文本区，video_frame 所在的 video_container 未显示）。
+        # 只要 VLC 手里有一个嵌入窗口可画，它就**绝不会**另开独立的
+        # 「VLC (Direct3D11 output)」窗口；此时画面被画进隐藏控件里，肉眼看不见。
+        # （此前用 isVisible() 判断，隐藏时不绑定 → 一旦 _stop_video 解绑过，就会冒出独立窗口。）
         try:
-            if not self.video_frame.isVisible():
-                self._vlc_parent_hwnd = None
-            else:
-                hwnd = int(self.video_frame.winId())
-                # 简单验证句柄是否有效（非零且窗口存在）
-                if sys.platform == "win32" and hwnd:
-                    if ctypes.windll.user32.IsWindow(hwnd):
-                        self._vlc_parent_hwnd = hwnd
-                        self.player.set_hwnd(hwnd)
-                    else:
-                        self._vlc_parent_hwnd = None
+            hwnd = int(self.video_frame.winId())
+            # 简单验证句柄是否有效（非零且窗口存在）
+            if sys.platform == "win32" and hwnd:
+                if ctypes.windll.user32.IsWindow(hwnd):
+                    self._vlc_parent_hwnd = hwnd
+                    self.player.set_hwnd(hwnd)
                 else:
-                    self._vlc_parent_hwnd = hwnd if hwnd else None
+                    self._vlc_parent_hwnd = None
+            else:
+                self._vlc_parent_hwnd = hwnd if hwnd else None
         except Exception:
             self._vlc_parent_hwnd = None
         self.player.set_media(media)
@@ -2946,8 +3519,30 @@ class PracticePage(QWidget):
     def _stop_video(self):
         # 同步停止，避免 QTimer.singleShot(0, ...) 的停止事件排在新 play() 之后，
         # 导致刚启动的音视频（如 Part A 的"听录音"音频-only 步骤）被立即停掉。
+        #
+        # ⚠️ 顺序很关键：先暂停 → 再解绑嵌入窗口(set_hwnd(0)) → 最后 stop()。
+        # 若直接 stop()，VLC 的视频输出线程(vout)仍绑定在 Qt 原生窗口(video_frame)上，
+        # 它会在 GUI 线程上死等，窗口随即「未响应」（返回主页时必现）。
+        try:
+            self.player.set_pause(1)
+        except Exception:
+            pass
+        try:
+            self.player.set_hwnd(0)   # 先解绑嵌入窗口，再 stop
+            self._vlc_parent_hwnd = None
+        except Exception:
+            pass
         try:
             self.player.stop()
+        except Exception:
+            pass
+        # 清空媒体，防止旧媒体的 EndReached 事件在阶段切换后仍触发回调
+        try:
+            self.player.set_media(None)
+        except Exception:
+            pass
+        try:
+            self.player.audio_set_volume(100)
         except Exception:
             pass
         # 清空媒体，防止旧媒体的 EndReached 事件在阶段切换后仍触发回调
@@ -3010,7 +3605,12 @@ class PracticePage(QWidget):
         path = os.path.join(base_dir, fname)
         if self._audio_frames:
             data = np.concatenate(self._audio_frames)
-            wav_write.write(path, SAMPLE_RATE, data)
+            # 标准库 wave 写 PCM int16，等价于原 scipy.io.wavfile.write(path, RATE, int16_arr)
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)          # int16 = 2 字节
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(data.astype(np.int16).tobytes())
             return path
         return None
 
@@ -3711,6 +4311,85 @@ def load_vosk_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return Model(MODEL_PATH)
+
+# ===== 更新检查（仅提示，不自动下载/替换）=====
+APP_VERSION = "2.1"   # 当前版本号；发布新版本时只改这一处
+# version.json 放在 GitHub 仓库根目录。更新源顺序：
+#   1) GitHub API：读实时文件、无 CDN 缓存，改完立即生效（优先）；
+#   2) jsDelivr：国内直连快，但有缓存，作兜底；
+#   3) raw.githubusercontent：常被墙，最后兜底。
+# 按顺序取第一个返回合法 version.json 的源（全部失败则跳过本次检查，不影响使用）。
+UPDATE_INFO_URLS = [
+    "https://api.github.com/repos/FallingLighty/SoloTalk/contents/version.json?ref=main",
+    "https://cdn.jsdelivr.net/gh/FallingLighty/SoloTalk@main/version.json",
+    "https://fastly.jsdelivr.net/gh/FallingLighty/SoloTalk@main/version.json",
+    "https://raw.githubusercontent.com/FallingLighty/SoloTalk/main/version.json",
+]
+UPDATE_INFO_URL = UPDATE_INFO_URLS[0]   # 兼容旧引用/日志展示
+# 平台通道：桌面版读 desktop；手机/安卓版打包时把该值改为 "mobile"
+CHANNEL = "mobile" if hasattr(sys, "getandroidapilevel") else "desktop"
+
+
+class UpdateChecker(QThread):
+    update_available = pyqtSignal(dict)   # {version, notes, url}
+
+    def run(self):
+        print(f"[UPDATE] 开始检查更新（通道={CHANNEL}，本机版本={APP_VERSION}）")
+        data = None
+        for url in UPDATE_INFO_URLS:
+            try:
+                # 加时间戳绕开 CDN 缓存，尽量读到最新提交（对 GitHub API 无害）
+                _sep = "&" if "?" in url else "?"
+                _url = f"{url}{_sep}t={int(time.time())}"
+                req = urllib.request.Request(
+                    _url,
+                    headers={"User-Agent": f"SoloTalk/{APP_VERSION}"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    text = resp.read().decode("utf-8")
+                parsed = json.loads(text)
+                # GitHub API 返回的是包装结构：{content: base64, encoding: "base64", ...}
+                if isinstance(parsed, dict) and parsed.get("encoding") == "base64" and "content" in parsed:
+                    import base64
+                    parsed = json.loads(base64.b64decode(parsed["content"]).decode("utf-8"))
+                # 校验是否为合法的 version.json（必须含 desktop / mobile 通道）
+                if not (isinstance(parsed, dict) and ("desktop" in parsed or "mobile" in parsed)):
+                    raise ValueError("version.json 结构异常")
+                data = parsed
+                print(f"[UPDATE] version.json 读取成功（来源: {url}）")
+                break
+            except Exception as e:
+                print(f"[UPDATE] 该源不可用，换下一个: {url}  ({type(e).__name__}: {e})")
+        if data is None:
+            print("[UPDATE] 所有更新源均不可用（已忽略，不影响使用）")
+            return
+        try:
+            info = data.get(CHANNEL, data.get("desktop", {}))
+            if not info:
+                print(f"[UPDATE] version.json 缺少 {CHANNEL} 通道信息，跳过")
+                return
+            latest = str(info.get("version", ""))
+            if latest and self._is_newer(latest, APP_VERSION):
+                print(f"[UPDATE] 发现新版本 {latest}（本机 {APP_VERSION}），下载链接: {info.get('url', '')}")
+                self.update_available.emit({
+                    "version": latest,
+                    "notes": info.get("notes", ""),
+                    "url": info.get("url", ""),
+                })
+            else:
+                print(f"[UPDATE] 已是最新（本机 {APP_VERSION} >= 远端 {latest}），无需更新")
+        except Exception as e:
+            print(f"[UPDATE] 解析失败（已忽略）: {e}")
+
+    @staticmethod
+    def _is_newer(latest, current):
+        def _t(v):
+            return tuple(int(x) for x in str(v).split(".") if x.strip().isdigit())
+        try:
+            return _t(latest) > _t(current)
+        except Exception:
+            return False
+
 
 if __name__ == "__main__":
     # 启动时打印资源路径（已自动写入诊断日志）
