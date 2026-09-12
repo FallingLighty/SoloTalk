@@ -2,7 +2,7 @@
 
 源代码：[FallingLighty/SoloTalk: 自制免费开源听说软件](https://github.com/FallingLighty/SoloTalk)
 
-交流群：QQ：1091799764
+交流群：QQ：1091799764  点击链接加入群聊【SoloTalkの创意工坊】：https://qm.qq.com/q/o4Yfw2jsDm
 
 ![工坊](https://cdn.wakudemo.cn/games/101818/w-ms64m0w1dmxf1v/images/Game101818Pic126defb5a9d.jpg)
 
