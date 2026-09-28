@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-SoloTalk 2.1 — 单机版听说模考编辑器
+SoloTalk 2.2 — 单机版听说模考编辑器
 依赖安装：pip install PyQt5 pyttsx3 sounddevice vosk python-vlc numpy fastembed edge-tts
 （edge-tts 为高质量神经语音，需联网；未安装或断网时自动回退系统 SAPI5 语音）
 所有控制台输出（print / 异常栈 / 崩溃栈）都会同步写入 _solo_diag.log（打包后写用户主目录），方便无控制台环境排查。
@@ -23,6 +23,7 @@ hf download Xenova/bge-small-en-v1.5 --local-dir "脚本同级目录/bge-small-e
 import sys
 import os
 import json
+import weakref
 import zipfile
 import tempfile
 import wave
@@ -250,6 +251,198 @@ def _resolve_resource_file(name):
             return p
     return None
 
+
+# ------------------ UI 字体：HarmonyOS Sans SC（鸿蒙，免费可商用） ------------------
+# ⚠️ 背景：PyQt5 的 Fusion 风格在 Windows 上默认解析出的字体是 **SimSun（宋体）9pt**，
+#    整个程序所有中文都在用宋体渲染，观感很别扭 —— 必须显式覆盖全局字体。
+# ⚠️ 字体文件缺失（比如没打进包）时静默回退到系统字体，绝不能因字体导致启动失败。
+#    HarmonyOS Sans SC 版权：Copyright 2021 Huawei Device Co., Ltd. & 汉仪，免费可商用。
+_FONT_FILES = {
+    "regular": "fonts/HarmonyOS_Sans_SC_Regular.ttf",
+    "medium":  "fonts/HarmonyOS_Sans_SC_Medium.ttf",
+}
+_FONT_FALLBACK = ["Segoe UI", "Microsoft YaHei", "PingFang SC"]
+
+# 可在「更多 → 个性化」里切换的界面字体。value 是 Qt 字体族名，
+# 只有内嵌鸿蒙用这个哨兵 key —— 不用 None，否则"用户显式选了鸿蒙"和"用户没设置过"
+# 在 JSON 里都是 null，没法区分。
+EMBEDDED_FONT_KEY = "__embedded_harmonyos__"
+DEFAULT_FONT_CHOICE = "Microsoft YaHei UI"      # 默认界面字体（用户指定）
+
+FONT_CHOICES = [
+    ("微软雅黑 UI", "Microsoft YaHei UI"),        # 默认
+    ("鸿蒙 HarmonyOS Sans SC", EMBEDDED_FONT_KEY),  # 随包内嵌（免费可商用）
+    ("楷体", "楷体"),
+    ("思源黑体 Noto Sans SC", "Noto Sans SC"),
+    ("系统默认 Segoe UI", "Segoe UI"),
+]
+SETTINGS_FONT_KEY = "ui_font"
+
+_UI_FONT = {"regular": None, "medium": None, "choice": None}   # 装填 Qt 里注册出的族名
+
+# 用 _bind_font() 登记过的控件：用户切换字体时统一刷新（弱引用，避免拦住控件回收）
+_FONT_BOUND = []
+
+
+def _load_app_fonts():
+    """把内嵌的鸿蒙字体注册进 QFontDatabase（必须在 QApplication 之后调用）。
+
+    结果写进模块级 `_UI_FONT`：`{"regular": 族名或 None, "medium": 族名或 None}`，
+    None 表示文件没找到/加载失败，此时调用方要用 `_FONT_FALLBACK`。
+    """
+    for key, rel in _FONT_FILES.items():
+        try:
+            p = _resolve_resource_file(rel)
+            if not p:
+                print(f"[FONT] 未找到字体文件，跳过: {rel}")
+                continue
+            fid = QFontDatabase.addApplicationFont(p)
+            if fid < 0:
+                print(f"[FONT] 加载失败: {rel}")
+                continue
+            names = QFontDatabase.applicationFontFamilies(fid)
+            if names:
+                _UI_FONT[key] = names[0]
+                print(f"[FONT] 已加载 {rel} -> {names[0]}")
+        except Exception as e:
+            print(f"[FONT] 加载异常 {rel}: {e}")
+    return _UI_FONT
+
+
+def _available_font_choices():
+    """列出本机可用的字体选项：[(显示名, 族名或 None)]，第一个永远是内嵌鸿蒙。"""
+    try:
+        installed = set(QFontDatabase().families())
+    except Exception:
+        installed = set()
+    out = []
+    for label, key in FONT_CHOICES:
+        if key == EMBEDDED_FONT_KEY:
+            # 内嵌鸿蒙没加载成功就不列出来，免得选了没反应
+            if _UI_FONT.get("regular"):
+                out.append((label, key))
+        elif key in installed:
+            out.append((label, key))
+    return out
+
+
+def _ui_font(size_px, medium=False, bold=False):
+    """生成 UI 字体：用户选定字体 > 内嵌鸿蒙 > Segoe UI + 雅黑。
+
+    size_px 用像素（样式表里写的也是 px，保持一致）；默认 12px = 9pt，
+    与改版前同尺寸，避免撑破练习页等固定尺寸排版。
+    medium=True 时优先用鸿蒙 Medium 字重（比合成粗体干净）；选了系统字体就用 QFont.Bold 模拟。
+    """
+    f = QFont()
+    chosen = _UI_FONT.get("choice")
+    fam_medium = _UI_FONT.get("medium")
+    fam_regular = _UI_FONT.get("regular")
+    if chosen == EMBEDDED_FONT_KEY:
+        chosen = None          # 哨兵 → 走内嵌鸿蒙那条分支
+
+    if chosen:
+        f.setFamilies([chosen] + [x for x in _FONT_FALLBACK if x != chosen])
+        f.setWeight(QFont.Bold if (medium or bold) else QFont.Normal)
+    elif medium and fam_medium:
+        # 鸿蒙 Medium 是独立族名，本身就是中黑体，不要再叠合成粗体
+        f.setFamily(fam_medium)
+        f.setWeight(QFont.Normal)
+    elif fam_regular:
+        f.setFamily(fam_regular)
+        f.setWeight(QFont.Bold if bold else QFont.Normal)
+    else:
+        f.setFamilies(_FONT_FALLBACK)
+        f.setWeight(QFont.Bold if (bold or medium) else QFont.Normal)
+    f.setPixelSize(size_px)
+    return f
+
+
+def _bind_font(widget, size_px, medium=False, bold=False):
+    """给控件设 UI 字体并登记，用户切换字体时能跟着一起变。返回该控件方便链式调用。"""
+    try:
+        widget.setFont(_ui_font(size_px, medium=medium, bold=bold))
+        _FONT_BOUND.append((weakref.ref(widget), size_px, medium, bold))
+    except Exception:
+        pass
+    return widget
+
+
+def _refresh_bound_fonts():
+    """字体切换后调用：把所有登记过的控件字体重设一遍（已销毁的自动剔除）。"""
+    global _FONT_BOUND
+    alive = []
+    for ref, size_px, medium, bold in _FONT_BOUND:
+        w = ref()
+        if w is None:
+            continue
+        try:
+            w.setFont(_ui_font(size_px, medium=medium, bold=bold))
+            alive.append((ref, size_px, medium, bold))
+        except RuntimeError:
+            pass          # 底层 C++ 对象已被销毁（Qt 经典坑）
+    _FONT_BOUND = alive
+
+
+def _svg_pixmap(paths, color, size):
+    """把一组 SVG path 渲成单色线性图标（Fluent 风格：描边、无填充）。
+
+    ⚠️ QtSvg 缺失时返回空 pixmap（静默降级，不崩）。图标用 SVG 而不是图标字体，
+    是因为 Win10 只有旧的 Segoe MDL2 Assets、码点和 Win11 的 Segoe Fluent Icons 不一致，
+    分发给学生机不可控。
+    """
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    if _QSvgRenderer is None:
+        return pix
+    body = "".join(f'<path d="{d}"/>' for d in paths)
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}"'
+           f' viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.8"'
+           f' stroke-linecap="round" stroke-linejoin="round">{body}</svg>')
+    r = _QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    p = QPainter(pix)
+    r.render(p)
+    p.end()
+    return pix
+
+
+def _repolish_all(app=None):
+    """强制所有控件重新套一遍样式表（返回处理了几个控件）。
+
+    ⚠️ 这一步不能省。全程序有大量控件是靠 `setStyleSheet("font-size:14px")` 定字号的
+    （`MorePage._sub()` / `_para()` 等），它们走 QStyleSheetStyle 那条路，Qt 会把解析出的
+    字体**缓存**在样式里。只调 `QApplication.setFont()` 的话它们根本不跟着变 ——
+    现象就是"换字体"后半页变了半页没变。unpolish + polish 一次把缓存冲掉即可。
+    """
+    app = app or QApplication.instance()
+    if app is None:
+        return 0
+    n = 0
+    for w in app.allWidgets():
+        try:
+            st = w.style()
+            st.unpolish(w)
+            st.polish(w)
+            w.update()
+            n += 1
+        except RuntimeError:
+            pass          # 底层 C++ 对象已销毁（Qt 经典坑）
+    return n
+
+
+def _set_ui_font_choice(family):
+    """切换界面字体：立即应用到整个程序（含已登记控件 + QSS 定字号的控件）。返回是否成功。"""
+    _UI_FONT["choice"] = family
+    app = QApplication.instance()
+    if app is None:
+        return False
+    app.setFont(_ui_font(12))
+    _refresh_bound_fonts()
+    n = _repolish_all(app)
+    _shown = "鸿蒙 HarmonyOS Sans SC" if family in (None, EMBEDDED_FONT_KEY) else family
+    print(f"[FONT] 界面字体已切换为: {_shown}（重刷 {n} 个控件）")
+    return True
+
+
 # 切换工作目录到脚本所在目录
 if os.getcwd() != _SCRIPT_DIR:
     try:
@@ -425,6 +618,13 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 
+# 单色线性图标用内联 SVG 渲染（零体积、不依赖图标字体）。
+# QtSvg 是 PyQt5 自带模块；万一缺失就降级成纯色圆点，绝不能因此启动失败。
+try:
+    from PyQt5.QtSvg import QSvgRenderer as _QSvgRenderer
+except Exception:      # pragma: no cover
+    _QSvgRenderer = None
+
 # ------------------ Windows 键屏蔽（模考全屏锁定用）------------------
 # Python 3.14 的 ctypes.wintypes 不再保证暴露 LRESULT/WPARAM/HHOOK 等别名，
 # 这里用与平台位宽一致的基础类型自行定义，避免 AttributeError/OverflowError。
@@ -439,6 +639,10 @@ _HINSTANCE = _wintype("HINSTANCE", ctypes.c_void_p)
 _DWORD = _wintype("DWORD", ctypes.c_uint32)
 _BOOL = _wintype("BOOL", ctypes.c_int)
 _ULONG_PTR = ctypes.c_size_t
+
+# 永久保留已卸载的 ctypes 钩子回调对象（见 WindowsKeyBlocker.uninstall 注释）
+_KEEPALIVE_HOOK_CALLBACKS = []
+
 
 class WindowsKeyBlocker:
     """通过底层键盘钩子屏蔽系统级快捷键，仅用于模考模式锁定：
@@ -500,7 +704,13 @@ class WindowsKeyBlocker:
         if self._hook:
             self._user32.UnhookWindowsHookEx(self._hook)
             self._hook = None
-            self._proc = None
+            # ⚠️ 不要直接让 self._proc 被 GC。ctypes 回调对象就是交给 Windows 的函数指针，
+            # 全局钩子（WH_KEYBOARD_LL）在「卸载」与「最后一次回调」之间存在竞态，
+            # 一旦回调对象被释放后 Windows 再调用它 → 跳到已释放内存 → 直接闪退（无 traceback）。
+            # 这里把引用永久留在模块级列表里，用一点点常驻内存换掉这一整类崩溃。
+            if self._proc is not None:
+                _KEEPALIVE_HOOK_CALLBACKS.append(self._proc)
+                self._proc = None
 
 # ------------------ 全局配置 ------------------
 MODEL_PATH = _resolve_model_dir("vosk-model-small-en-us-0.15")
@@ -872,7 +1082,7 @@ class SoloPackage:
     def __init__(self):
         self.meta = {
             "name": "Untitled",
-            "version": "2.1",
+            "version": "2.2",
             "created": datetime.datetime.now().isoformat(),
             "author": "",
             "anonymous": False
@@ -949,6 +1159,26 @@ class SoloPackage:
             self.partC_audio_path = os.path.join(base_dir, pc["audio"])
         self.partC_key_points = pc.get("key_points", "")
 
+    def keep_only_parts(self, parts):
+        """专项训练：只保留选定篇目（A/B/C）的数据，清掉未选篇目，
+        使后续解析/批改/历史都只围绕选定内容，彻底忽略未选篇目数据。"""
+        if "A" not in parts:
+            self.partA_video_path = None
+            self.partA_hidden_text = ""
+        if "B" not in parts:
+            self.partB_situation = ""
+            self.partB_listening_text = ""
+            self.partB_listening_audio = None
+            self.partB_three_questions = []
+            self.partB_five_answers = []
+        if "C" not in parts:
+            self.partC_summary = ""
+            self.partC_keywords = ""
+            self.partC_source_type = "tts"
+            self.partC_tts_text = ""
+            self.partC_audio_path = None
+            self.partC_key_points = ""
+
 class PracticeSession:
     def __init__(self, package_name):
         self.package_name = package_name
@@ -1001,6 +1231,20 @@ class MainWindow(QMainWindow):
             print("[UPDATE] 已按用户设置跳过启动自动检查更新")
 
         self.show()
+
+    def set_ui_font(self, family):
+        """切换界面字体（「更多 → 个性化」调用）：立即生效 + 记住选择。
+
+        family 是 Qt 字体族名；内嵌鸿蒙用哨兵 EMBEDDED_FONT_KEY 表示。
+        """
+        try:
+            _set_ui_font_choice(family)
+        except Exception as e:
+            print(f"[FONT] 切换失败: {e}")
+            return False
+        self.settings[SETTINGS_FONT_KEY] = family
+        _save_settings(self.settings)
+        return True
 
     def go_to(self, page):
         # 保险：离开练习页面前，先彻底停止视频并解绑嵌入窗口。
@@ -1066,65 +1310,732 @@ class MainWindow(QMainWindow):
         layout.addLayout(box)
         dlg.exec_()
 
+class _SmoothScroll(QObject):
+    """给 QAbstractScrollArea 加缓动滚动（微信 / SecRandom 那种跟手又顺滑的手感）。
+
+    ⚠️ 只接管鼠标滚轮：把它换成对滚动条的 QPropertyAnimation。
+       拖动滚动条、键盘 PgUp/PgDn、惯性触摸都不受影响。
+    ⚠️ 这个类必须在 `from PyQt5.QtCore import *` 之后定义 —— 基类 QObject 是定义期就要求值的，
+       放在文件顶部的字体工具区（Qt 导入之前）会直接 NameError。
+    """
+
+    DURATION_MS = 190     # 缓动时长（太长会显得"没反应"，190ms 仍有明显缓动）
+    PX_PER_NOTCH = 100    # 滚轮一格 100px（原生只滚 3 行≈58px，长页面要滚到手酸）
+
+    def __init__(self, area):
+        super().__init__(area)
+        self._v = area.verticalScrollBar()
+        self._h = area.horizontalScrollBar()
+        self._av = self._make_anim(self._v)
+        self._ah = self._make_anim(self._h)
+        area.viewport().installEventFilter(self)
+
+    def _make_anim(self, bar):
+        a = QPropertyAnimation(bar, b"value", self)
+        a.setEasingCurve(QEasingCurve.OutCubic)
+        a.setDuration(self.DURATION_MS)
+        return a
+
+    def _glide(self, anim, bar, delta_px):
+        """把滚动条从当前位置缓动到目标位置；返回 False 表示这条轴滚不动。"""
+        target = max(bar.minimum(), min(bar.maximum(), int(bar.value() + delta_px)))
+        if target == bar.value():
+            return False
+        # 连滚时从「当前实际位置」续接，不排队、不卡顿
+        anim.stop()
+        anim.setStartValue(bar.value())
+        anim.setEndValue(target)
+        anim.start()
+        return True
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Wheel:
+            pd, ad = ev.pixelDelta(), ev.angleDelta()
+            if pd.y() or pd.x():                 # 触摸板 / 高精度滚轮：按像素
+                dy, dx = -pd.y(), -pd.x()
+            else:                                # 普通滚轮：一格 120
+                dy = -ad.y() / 120.0 * self.PX_PER_NOTCH
+                dx = -ad.x() / 120.0 * self.PX_PER_NOTCH
+            if dy and self._glide(self._av, self._v, dy):
+                return True
+            if dx and self._glide(self._ah, self._h, dx):
+                return True
+        return super().eventFilter(obj, ev)
+
+
+def _install_smooth_scroll():
+    """给当前已存在的所有 QScrollArea 装上缓动滚动（在 MainWindow 构造完之后调用）。"""
+    n = 0
+    for w in QApplication.allWidgets():
+        if isinstance(w, QScrollArea):
+            _SmoothScroll(w)
+            n += 1
+    print(f"[UI] 已为 {n} 个滚动区域启用缓动滚动")
+    return n
+
+
+# ══════════════════ 「练习详情」对话框的 Fluent 控件工厂 ══════════════════
+# ❗ 为什么详情页必须用「真控件」而不是继续拼 HTML：
+#   QTextBrowser 的富文本引擎**完全不支持 border-radius / box-shadow**（实测：圆角色块
+#   角落像素是纯色 —— 即方角；色块上方也没有阴影渐变）。而 SecRandom / ClassIsland 那套
+#   观感的核心恰恰是"大圆角卡片"，用 HTML 拼永远拼不出圆角，只能上真 QFrame + QSS。
+#   旧的 HTML 版保留在 `_detail_html_legacy()` 里做异常兜底。
+
+D_BG_TOP, D_BG_BOT = "#F7FBFF", "#EDF6FC"      # 页面渐变（与首页同源）
+D_CARD, D_BD, D_LINE = "#FFFFFF", "#E3ECF3", "#EEF3F7"
+D_TEXT, D_SUB, D_MUTED = "#1A2B3C", "#5A6B7B", "#9AA7B4"
+# ❗表头列分隔线专用色：必须比 D_LINE(#EEF3F7) 明显。
+#   原用 D_LINE 画表头 border-right，颜色 (238,243,247) 与表头灰底 (240,240,240)
+#   几乎同亮度 → 用户完全看不到分隔线（"分隔线呢？"），也就找不到拖拽把手。
+D_DIV = "#BCCFE0"
+D_ACCENT, D_ACCENT_DEEP, D_ACCENT_SOFT = "#66CCFF", "#0A9BE0", "#E8F6FF"
+
+# 单色线性图标（24×24 描边风格，与首页同一套视觉语言；Feather 风格路径，MIT）
+D_ICON_PKG = [
+    "M16.5 9.4l-9-5.19",
+    "M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73"
+    "l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z",
+    "M3.27 6.96L12 12.01l8.73-5.05",
+    "M12 22.08V12",
+]
+D_ICON_MIC = [
+    "M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z",
+    "M19 10v2a7 7 0 0 1-14 0v-2",
+    "M12 19v4",
+    "M8 23h8",
+]
+D_ICON_CHART = ["M18 20V10", "M12 20V4", "M6 20v-6"]
+D_ICON_DOC = [
+    "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z",
+    "M14 2v6h6",
+    "M16 13H8",
+    "M16 17H8",
+    "M10 9H8",
+]
+
+
+def _d_label(text, size_px=13, color=D_TEXT, medium=False, bold=False,
+             wrap=True, selectable=False, parent=None):
+    """详情页通用文字：走 _bind_font 登记，用户切全局字体时会一起变。
+
+    ❗ 这里必须用 RichText + 转义，两个坑一起踩过：
+      ① **尾部空白**：题目包里 `en_question` 结尾自带 `\\n\\n`，不 strip 掉就凭空多出两行
+         空白（实测那一行从 54px 变成 88px，标题和答案之间裂开一道缝）。
+      ② **PlainText 的行高算不准**：QLabel 纯文本 + wordWrap 算出的 sizeHint/heightForWidth
+         对英文会虚高，多出来的高度被布局当成空闲分给文字 —— 整张「题目内容」卡凭空多出
+         约 360px，到处是缝隙。改成富文本后走 QTextDocument 排版，高度才准。
+      既然是富文本就必须转义（`&<>"`），并把 `\\n` 转成 `<br>`（否则换行会被折叠成空格）。
+    """
+    lb = QLabel(parent)
+    lb.setTextFormat(Qt.RichText)
+    lb.setText(f"<span style='color:{color}'>{_esc(str(text).strip())}</span>")
+    lb.setWordWrap(wrap)
+    if selectable:
+        lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    _bind_font(lb, size_px, medium=medium, bold=bold)
+    lb.setStyleSheet("background:transparent;")
+    return lb
+
+
+def _d_hline():
+    ln = QFrame()
+    ln.setObjectName("dLine")
+    ln.setFixedHeight(1)
+    ln.setStyleSheet(f"#dLine{{background:{D_LINE};border:none;}}")
+    return ln
+
+
+def _d_card(title=None, icon_paths=None):
+    """Fluent 白卡片：圆角 14 + 1px 淡描边 + 标题行 + 细分割线。返回 (卡片, 内容布局)。"""
+    f = QFrame()
+    f.setObjectName("dCard")
+    f.setStyleSheet(
+        f"#dCard{{background:{D_CARD};border:1px solid {D_BD};border-radius:14px;}}")
+    v = QVBoxLayout(f)
+    v.setContentsMargins(18, 15, 18, 17)
+    v.setSpacing(11)
+    if title:
+        hd = QHBoxLayout()
+        hd.setSpacing(8)
+        if icon_paths:
+            ic = QLabel()
+            ic.setFixedSize(18, 18)
+            ic.setStyleSheet("background:transparent;")
+            ic.setPixmap(_svg_pixmap(icon_paths, D_ACCENT_DEEP, 18))
+            hd.addWidget(ic)
+        hd.addWidget(_d_label(title, 15, D_TEXT, medium=True, wrap=False))
+        hd.addStretch(1)
+        v.addLayout(hd)
+        v.addWidget(_d_hline())
+    return f, v
+
+
+def _d_panel(bg, border, radius=10, margins=(14, 11, 14, 12), spacing=6):
+    """带底色的圆角面板（真控件，QSS 的 border-radius 在 QFrame 上是真生效的）。"""
+    f = QFrame()
+    f.setObjectName("dPanel")
+    f.setStyleSheet(
+        f"#dPanel{{background:{bg};border:1px solid {border};border-radius:{radius}px;}}")
+    v = QVBoxLayout(f)
+    v.setContentsMargins(*margins)
+    v.setSpacing(spacing)
+    return f, v
+
+
+def _d_chip(text, fit=False):
+    """小标签：浅蓝底、圆角、可选中复制。
+
+    fit=False（默认，录音文件名）/ 允许断行并填满所在列，长文件名不会撑爆列宽；
+    fit=True（头部模式徽标）/ 按内容自适应宽度、不折行 —— 否则会被布局压到
+    最小宽度（60px）后竖排换行，和右上角时间戳叠在一起。
+    """
+    lb = _d_label(text, 12, "#283593", wrap=not fit, selectable=True)
+    lb.setObjectName("dChip")
+    if fit:
+        lb.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+    else:
+        lb.setMinimumWidth(60)
+        # 文件名很长且没有空格时，允许 QLabel 在任意位置断行，避免把列撑爆
+        lb.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    lb.setStyleSheet(
+        "#dChip{background:#F2F8FD;border:1px solid #DCE9F3;border-radius:8px;"
+        "color:#283593;padding:6px 10px;}")
+    return lb
+
+
+def _d_score_row(lab, sim, pts, pts_color, per, bar_color):
+    """三问/五答 的一行：白底 + 左侧彩色竖条。"""
+    f = QFrame()
+    f.setObjectName("dSRow")
+    f.setStyleSheet(
+        f"#dSRow{{background:#FFFFFF;border:none;border-left:4px solid {bar_color};"
+        f"border-radius:6px;}}")
+    h = QHBoxLayout(f)
+    h.setContentsMargins(12, 7, 12, 7)
+    h.setSpacing(0)
+    h.addWidget(_d_label(f"{lab} 匹配度：{sim * 100:.1f}%", 13, "#2C3E50", wrap=False))
+    h.addStretch(1)
+    h.addWidget(_d_label("得分：", 13, D_SUB, wrap=False))
+    h.addWidget(_d_label(f"{pts:.1f}", 15, pts_color, bold=True, wrap=False))
+    h.addWidget(_d_label(f"/{per}", 12, D_MUTED, wrap=False))
+    return f
+
+
+def _d_part_block(title, score, max_score, score_color, note, bg, border, title_color):
+    """左栏的「Part X 得分：n/m」小块（保留 A 蓝 / B 粉 / C 黄 的原有配色约定）。"""
+    f, v = _d_panel(bg, border, margins=(14, 11, 14, 12), spacing=4)
+    h = QHBoxLayout()
+    h.setSpacing(6)
+    h.addWidget(_d_label(title, 14, title_color, medium=True, wrap=False))
+    h.addWidget(_d_label(f"{score:.1f}", 18, score_color, bold=True, wrap=False))
+    h.addWidget(_d_label(f"/{max_score}", 13, D_SUB, wrap=False))
+    h.addStretch(1)
+    v.addLayout(h)
+    if note:
+        v.addWidget(_d_label(note, 12, D_SUB, wrap=True))
+    return f
+
+
+def _d_section(title, color, body_widget):
+    """「▍标题 + 内容块」——与 MorePage._sub() 同一套小节语言。"""
+    w = QWidget()
+    w.setStyleSheet("background:transparent;")
+    v = QVBoxLayout(w)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(7)
+    head = QLabel(f"<span style='color:{color};'>▍</span>{title}")
+    head.setTextFormat(Qt.RichText)
+    _bind_font(head, 13, medium=True)
+    head.setStyleSheet("background:transparent;")
+    v.addWidget(head)
+    v.addWidget(body_widget)
+    return w
+
+
+class FluentSelect(QPushButton):
+    """Fluent/微信 风格下拉选择：白底圆角按钮（左文右箭头）+ 点开的干净菜单。
+
+    为什么不用 QComboBox（这个坑实测过，别再回头）：
+      · QSS 一旦覆盖 `::drop-down`，Fusion 就**再也不画下拉箭头**，框右边一片空白；
+      · 不覆盖又带回原生边框，观感很脏；弹出列表更是 Windows 原生白底 + 黑框焦点块，
+        跟整体风格完全打架（用户截图里"奇奇怪怪"的就是它）。
+    自己拿 QMenu 搭反而干净可控，样式全集中在这一个类里。
+    """
+
+    changed = pyqtSignal(object)      # 参数 = 选中项的 data
+
+    CHEVRON = ["M6.5 9.75L12 15.25l5.5-5.5"]
+
+    def __init__(self, parent=None, min_width=280, height=38, font_px=14):
+        super().__init__(parent)
+        self._items = []
+        self._index = 0
+        self.setObjectName("fluentSelect")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumWidth(min_width)
+        self.setFixedHeight(height)
+        # ⚠️ padding:0px 必须写：全局 QPushButton 的 padding 会挤进内部布局
+        self.setStyleSheet(
+            "QPushButton#fluentSelect { background:#ffffff; border:1px solid #d7e0e8;"
+            " border-radius:8px; padding:0px; text-align:left; }"
+            "QPushButton#fluentSelect:hover { border:1px solid #66CCFF; }"
+            "QPushButton#fluentSelect:pressed { background:#F4FAFF; }"
+        )
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 0, 10, 0)
+        row.setSpacing(8)
+        self._label = QLabel("")
+        self._label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._label.setStyleSheet("color:#2c3e50; background:transparent;")
+        _bind_font(self._label, font_px)
+        row.addWidget(self._label, 1)
+        self._chev = QLabel()
+        self._chev.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._chev.setFixedSize(16, 16)
+        self._chev.setPixmap(_svg_pixmap(self.CHEVRON, "#8fa3b5", 16))
+        row.addWidget(self._chev, 0, Qt.AlignVCenter)
+
+        self._menu = QMenu(self)
+        # 圆角：QMenu 在 Windows 上默认画成方角 + 系统阴影边框，QSS 的 border-radius 不会生效。
+        # 必须关掉系统边框 + 开半透明背景，让 QSS 自己画那个圆角矩形（微信那种观感）。
+        self._menu.setWindowFlags(
+            self._menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
+        )
+        self._menu.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._menu.setStyleSheet(
+            "QMenu { background:#ffffff; border:1px solid #e3eaf0; border-radius:10px;"
+            " padding:6px; }"
+            "QMenu::item { padding:8px 26px 8px 12px; border-radius:6px;"
+            " color:#2c3e50; font-size:14px; }"
+            "QMenu::item:selected { background:#E8F6FF; color:#0A9BE0; }"
+            "QMenu::item:checked { color:#0A9BE0; font-weight:bold; }"
+            "QMenu::indicator { width:0px; height:0px; }"   # 只要加粗高亮，不要勾选框
+        )
+        self.clicked.connect(self._open_menu)
+
+    # ---- 数据 ----
+    def addItem(self, text, data=None):
+        act = QAction(text, self._menu)
+        act.setCheckable(True)
+        act.setData(data)
+        act.triggered.connect(lambda _=False, a=act: self._on_pick(a))
+        self._menu.addAction(act)
+        self._items.append(act)
+        if len(self._items) == 1:
+            self.setCurrentIndex(0)
+        return act
+
+    def currentData(self):
+        if 0 <= self._index < len(self._items):
+            return self._items[self._index].data()
+        return None
+
+    def currentText(self):
+        if 0 <= self._index < len(self._items):
+            return self._items[self._index].text()
+        return ""
+
+    def setCurrentIndex(self, idx, emit=False):
+        """切换选中项；emit=True 时对外发 changed（构造期设初值用默认的 False）。"""
+        if not (0 <= idx < len(self._items)):
+            return
+        self._index = idx
+        for i, act in enumerate(self._items):
+            act.setChecked(i == idx)
+        self._label.setText(self._items[idx].text())
+        if emit:
+            self.changed.emit(self._items[idx].data())
+
+    def _on_pick(self, act):
+        self.setCurrentIndex(self._items.index(act), emit=True)
+
+    def _open_menu(self):
+        # 菜单贴左对齐按钮，宽度跟按钮一致，观感更像原生下拉
+        self._menu.setMinimumWidth(self.width())
+        pos = self.mapToGlobal(QPoint(0, self.height() + 4))
+        self._menu.exec_(pos)
+
+
+# ══════════════════ 专项训练 · 篇目选择对话框 ══════════════════
+# 与首页/详情卡片同套 Fluent 配色：天蓝主色 + 大圆角白卡 + 单色线性图标。
+# 三张可选卡片 = Part A 模仿朗读 / Part B 角色扮演 / Part C 故事复述，
+# 缺内容的篇目自动禁用并标注；至少选 1 篇才允许开始。
+_SPECIAL_PARTS = [
+    {
+        "key": "A", "phase": "partA", "letter": "A",
+        "title": "Part A 模仿朗读",
+        "desc": "观看视频并跟读，重点练语音语调节奏",
+        "color": "#E3F2FD", "color_deep": "#1565C0",
+    },
+    {
+        "key": "B", "phase": "partB", "letter": "B",
+        "title": "Part B 角色扮演",
+        "desc": "听对话后提问、听回答后作答，练听说转换",
+        "color": "#F7DCDC", "color_deep": "#a04a4a",
+    },
+    {
+        "key": "C", "phase": "partC", "letter": "C",
+        "title": "Part C 故事复述",
+        "desc": "听独白后用自己的话复述，练信息抓取与组织",
+        "color": "#FFFDE7", "color_deep": "#8a6d1f",
+    },
+]
+_SPECIAL_CHECK = ["M5 12l4 4 10-10"]   # 勾选标记
+
+
+class SpecialPartsDialog(QDialog):
+    def __init__(self, pkg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("专项训练 · 选择篇目")
+        self.setModal(True)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setMinimumWidth(440)
+        self.setMinimumHeight(420)
+        self._cards = {}          # key -> QPushButton
+        self._checks = {}         # key -> QLabel(勾选图)
+        self._parts = []          # 题目包实际可用的篇目
+
+        self.setObjectName("spRoot")
+        self.setStyleSheet(
+            f"#spRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f" stop:0 {D_BG_TOP}, stop:1 {D_BG_BOT}); }}")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(26, 22, 26, 18)
+        root.setSpacing(0)
+
+        title = QLabel("专项训练")
+        title.setAlignment(Qt.AlignCenter)
+        _bind_font(title, 26, medium=True)
+        title.setStyleSheet(f"color:{D_TEXT}; background:transparent;")
+        sub = QLabel("只练你选的篇目 · 免试音 · 进度独立记忆")
+        sub.setAlignment(Qt.AlignCenter)
+        _bind_font(sub, 13)
+        sub.setStyleSheet(f"color:{D_SUB}; background:transparent;")
+        root.addWidget(title)
+        root.addWidget(sub)
+        root.addSpacing(18)
+
+        # 全选快捷按钮
+        bar = QHBoxLayout()
+        bar.addStretch(1)
+        btn_all = QPushButton("全选")
+        btn_none = QPushButton("清空")
+        for b, slot in ((btn_all, self._select_all), (btn_none, self._clear_all)):
+            b.setCursor(Qt.PointingHandCursor)
+            _bind_font(b, 12)
+            b.setStyleSheet(
+                f"QPushButton {{ background:white; border:1px solid {D_BD};"
+                f" border-radius:8px; padding:6px 14px; color:{D_ACCENT_DEEP}; }}"
+                f"QPushButton:hover {{ background:{D_ACCENT_SOFT}; }}")
+            b.clicked.connect(slot)
+            bar.addWidget(b)
+        root.addLayout(bar)
+        root.addSpacing(12)
+
+        body = QVBoxLayout()
+        body.setSpacing(12)
+        # 题目包各篇目可用性探测
+        avail = self._availability(pkg)
+        for p in _SPECIAL_PARTS:
+            enabled = avail[p["phase"]]
+            if enabled:
+                self._parts.append(p["key"])
+            card = self._make_card(p, enabled)
+            body.addWidget(card)
+        root.addLayout(body)
+        root.addStretch(1)
+
+        # 底部按钮行
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        _bind_font(btn_cancel, 14)
+        btn_cancel.setStyleSheet(
+            f"QPushButton {{ background:white; border:1px solid {D_BD};"
+            f" border-radius:10px; padding:10px 18px; color:{D_SUB}; }}"
+            f"QPushButton:hover {{ background:{D_LINE}; }}")
+        btn_cancel.clicked.connect(self.reject)
+        self.btn_start = QPushButton("开始专项训练")
+        self.btn_start.setCursor(Qt.PointingHandCursor)
+        _bind_font(self.btn_start, 14, medium=True)
+        self.btn_start.setStyleSheet(
+            f"QPushButton {{ background:{D_ACCENT_DEEP}; border:none;"
+            f" border-radius:10px; padding:10px 18px; color:white; font-weight:bold; }}"
+            f"QPushButton:hover {{ background:{D_ACCENT}; }}"
+            f"QPushButton:disabled {{ background:{D_MUTED}; }}")
+        self.btn_start.clicked.connect(self.accept)
+        foot.addStretch(1)
+        foot.addWidget(btn_cancel)
+        foot.addWidget(self.btn_start)
+        root.addSpacing(14)
+        root.addLayout(foot)
+
+        self._refresh_start_state()
+
+    # ---- 内部 ----
+    @staticmethod
+    def _availability(pkg):
+        return {
+            "partA": bool(getattr(pkg, "partA_video_path", None)
+                          and os.path.exists(pkg.partA_video_path)),
+            "partB": bool((pkg.partB_three_questions if hasattr(pkg, "partB_three_questions") else [])
+                          or (pkg.partB_five_answers if hasattr(pkg, "partB_five_answers") else [])
+                          or (pkg.partB_listening_text if hasattr(pkg, "partB_listening_text") else "")),
+            "partC": bool((pkg.partC_tts_text if hasattr(pkg, "partC_tts_text") else "")
+                          or (pkg.partC_audio_path if hasattr(pkg, "partC_audio_path") else None)
+                          or (pkg.partC_summary if hasattr(pkg, "partC_summary") else "")),
+        }
+
+    def _make_card(self, p, enabled):
+        b = QPushButton()
+        b.setObjectName("spCard")
+        b.setCheckable(True)
+        b.setEnabled(enabled)
+        b.setFixedHeight(78)
+        b.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
+        b.setStyleSheet(
+            f"#spCard {{ background:{D_CARD}; border:1px solid {D_BD};"
+            f" border-radius:14px; padding:0px; text-align:left; }}"
+            f"#spCard:enabled:checked {{ background:{D_ACCENT_SOFT};"
+            f" border:1.5px solid {D_ACCENT_DEEP}; }}"
+            f"#spCard:disabled {{ background:#F2F5F8; border:1px dashed {D_BD}; }}"
+            f"#spCard:hover:enabled {{ border:1px solid {D_ACCENT}; }}")
+        lay = QHBoxLayout(b)
+        lay.setContentsMargins(16, 0, 16, 0)
+        lay.setSpacing(14)
+
+        badge = QLabel(p["letter"])
+        badge.setFixedSize(46, 46)
+        badge.setAlignment(Qt.AlignCenter)
+        _bind_font(badge, 22, medium=True)
+        badge.setStyleSheet(
+            f"background:{p['color']}; color:{p['color_deep']};"
+            f" border-radius:23px; padding:0px;")
+        lay.addWidget(badge)
+
+        txt = QVBoxLayout()
+        txt.setSpacing(4)
+        t = QLabel(p["title"])
+        _bind_font(t, 16, medium=True)
+        t.setStyleSheet(f"color:{D_TEXT}; background:transparent;")
+        d = QLabel(p["desc"] if enabled else p["desc"] + "（本题包暂无此篇内容）")
+        _bind_font(d, 12)
+        d.setStyleSheet(
+            f"color:{D_SUB if enabled else D_MUTED}; background:transparent;")
+        txt.addWidget(t)
+        txt.addWidget(d)
+        tw = QWidget()
+        tw.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        tw.setLayout(txt)
+        lay.addWidget(tw, 1)
+
+        check = QLabel()
+        check.setFixedSize(26, 26)
+        check.setAlignment(Qt.AlignCenter)
+        check.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        check.setPixmap(_svg_pixmap(_SPECIAL_CHECK, D_ACCENT_DEEP, 22))
+        check.setVisible(False)
+        lay.addWidget(check)
+
+        b.setProperty("key", p["key"])
+        b.toggled.connect(lambda on, k=p["key"]: self._on_toggle(k, on))
+        self._cards[p["key"]] = b
+        self._checks[p["key"]] = check
+        return b
+
+    def _on_toggle(self, key, on):
+        self._checks[key].setVisible(on)
+        self._refresh_start_state()
+
+    def _refresh_start_state(self):
+        sel = len(self.selected_parts())
+        self.btn_start.setEnabled(sel > 0)
+        self.btn_start.setText(f"开始专项训练（已选 {sel} 篇）" if sel else "开始专项训练")
+
+    def _select_all(self):
+        for k, card in self._cards.items():
+            if card.isEnabled():
+                card.setChecked(True)
+
+    def _clear_all(self):
+        for card in self._cards.values():
+            card.setChecked(False)
+
+    def selected_parts(self):
+        return [k for k, card in self._cards.items() if card.isChecked()]
+
+
 class HomePage(QWidget):
+    """首页：SecRandom 风格 —— 天蓝主色 + 2×2 宽磁贴卡 + 单色线性图标。
+
+    ⚠️ 两个 QSS/事件坑（改这个页面必须知道）：
+      1. 无选择器的样式表等价于 `*{}`，会把背景糊到所有子控件 → 一律 `#objectName` 限定；
+         另外 `QFrame{...}` 会连 `QLabel`（QLabel 继承 QFrame）一起命中。
+      2. 按钮里嵌的 QLabel 会吃掉鼠标事件，必须 `WA_TransparentForMouseEvents`，
+         否则点在图标/文字上按钮不响应。
+      3. 全局样式表给 QPushButton 设了 padding，自绘按钮必须显式 `padding:0px`。
+    """
+
+    # ---- 设计 token（改色只改这里）----
+    ACCENT      = "#66CCFF"   # SecRandom 默认主题色（天依蓝）
+    ACCENT_DEEP = "#0A9BE0"   # 图标/链接用的同色系深色，保证可读
+    ACCENT_SOFT = "#E8F6FF"   # 图标圆底 / hover 底色
+    BG_TOP      = "#F7FBFF"
+    BG_BOT      = "#EDF6FC"
+    CARD_BG     = "#FFFFFF"
+    CARD_BD     = "#E3ECF3"
+    TEXT        = "#1A2B3C"
+    TEXT_SUB    = "#7A8A9A"
+
+    # ---- 单色线性图标（24 viewBox 的 SVG path，stroke-only）----
+    ICON_PRACTICE = ["M4 15v-3a8 8 0 0 1 16 0v3", "M3.5 14.5h4v6h-4z", "M16.5 14.5h4v6h-4z"]
+    ICON_EXAM     = ["M6 3h9l4 4v14H6z", "M15 3v4h4", "M9 12h6", "M9 16h4"]
+    ICON_EDITOR   = ["M4 20l4-1 11-11a2.3 2.3 0 0 0-3.3-3.3L4.7 15.7z", "M14.5 6.6l3.3 3.3"]
+    ICON_HISTORY  = ["M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17z", "M12 7.5V12l3.2 2"]
+    ICON_SPECIAL  = ["M12 3v3", "M12 18v3", "M3 12h3", "M18 12h3",
+                     "M12 12m-5.5 0a5.5 5.5 0 1 0 11 0a5.5 5.5 0 1 0-11 0"]  # 准星/靶心：专项训练
+
     def __init__(self, main_window):
         super().__init__()
         self.main = main_window
-        layout = QVBoxLayout()
-        layout.setContentsMargins(24, 24, 24, 18)
-        layout.addStretch(1)   # 主体内容整体垂直居中，底部再留出「更多」入口
+        self.setObjectName("homeRoot")
+        self.setStyleSheet(
+            f"#homeRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f" stop:0 {self.BG_TOP}, stop:1 {self.BG_BOT}); }}"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(40, 34, 40, 24)
+        root.setSpacing(0)
+        root.addStretch(1)
+
+        center = QVBoxLayout()
+        center.setSpacing(0)
+
         title = QLabel("SoloTalk")
-        title.setStyleSheet("font-size:42px; font-weight:bold; color:#2c3e50;")
         title.setAlignment(Qt.AlignCenter)
+        _bind_font(title, 40, medium=True)
+        title.setStyleSheet(f"color:{self.TEXT}; background:transparent;")
         subtitle = QLabel("单机版英语听说模考编辑器 · 完全免费")
         subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setStyleSheet("font-size:16px; color:#7f8c8d; margin-bottom:30px;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        _bind_font(subtitle, 14)
+        subtitle.setStyleSheet(f"color:{self.TEXT_SUB}; background:transparent;")
+        center.addWidget(title)
+        center.addWidget(subtitle)
+        center.addSpacing(28)
 
-        btn_style = """
-            QPushButton { font-size:20px; padding:18px 50px; border:2px solid #3498db;
-                          border-radius:10px; background:white; color:#2c3e50; }
-            QPushButton:hover { background:#ecf0f1; }
-        """
-        btn_editor = QPushButton("✏️  编辑模式")
-        btn_editor.setStyleSheet(btn_style)
-        btn_editor.clicked.connect(lambda: self.main.go_to(self.main.editor_page))
-        btn_practice = QPushButton("🎧  练习模式")
-        btn_practice.setStyleSheet(btn_style)
-        btn_practice.setToolTip("可跳过 / 上一步，开头试音也能跳过")
-        btn_practice.clicked.connect(lambda: self.load_and_start("practice"))
-        btn_exam = QPushButton("📝  模考模式")
-        btn_exam.setStyleSheet(btn_style)
-        btn_exam.setToolTip("不可跳过 / 上一步，试音也不能跳过")
-        btn_exam.clicked.connect(lambda: self.load_and_start("exam"))
-        btn_history = QPushButton("📋  历史记录")
-        btn_history.setStyleSheet(btn_style)
-        btn_history.clicked.connect(lambda: self.main.go_to(self.main.history_page))
-        layout.addWidget(btn_editor, alignment=Qt.AlignCenter)
-        layout.addSpacing(20)
-        layout.addWidget(btn_practice, alignment=Qt.AlignCenter)
-        layout.addSpacing(20)
-        layout.addWidget(btn_exam, alignment=Qt.AlignCenter)
-        layout.addSpacing(20)
-        layout.addWidget(btn_history, alignment=Qt.AlignCenter)
-        layout.addStretch(1)
+        grid = QGridLayout()
+        grid.setSpacing(16)
+        tile_practice = self._tile(self.ICON_PRACTICE, "练习模式", "可跳过 / 上一步，试音也能跳过")
+        tile_practice.clicked.connect(lambda: self.load_and_start("practice"))
+        tile_exam = self._tile(self.ICON_EXAM, "模考模式", "不可跳过 / 上一步，试音不能跳过")
+        tile_exam.clicked.connect(lambda: self.load_and_start("exam"))
+        tile_editor = self._tile(self.ICON_EDITOR, "编辑模式", "制作与导入 .solo 题目包")
+        tile_editor.clicked.connect(lambda: self.main.go_to(self.main.editor_page))
+        tile_history = self._tile(self.ICON_HISTORY, "历史记录", "查看往次成绩与录音回放")
+        tile_history.clicked.connect(lambda: self.main.go_to(self.main.history_page))
+        grid.addWidget(tile_practice, 0, 0)
+        grid.addWidget(tile_exam, 0, 1)
+        grid.addWidget(tile_editor, 1, 0)
+        grid.addWidget(tile_history, 1, 1)
+        # 专项训练：通栏磁贴（占满两列），与首页同风格，但视觉上独立成行强调
+        tile_special = self._tile(self.ICON_SPECIAL, "专项训练", "任选 A / B / C 篇目组合 · 免试音 · 进度独立", wide=True)
+        tile_special.clicked.connect(lambda: self.load_and_start("special"))
+        grid.addWidget(tile_special, 2, 0, 1, 2)
 
-        # 左下角「更多」入口：作者介绍 / 更新 / 意见反馈 / 版本信息
+        grid_row = QHBoxLayout()
+        grid_row.addStretch(1)
+        grid_row.addLayout(grid)
+        grid_row.addStretch(1)
+        center.addLayout(grid_row)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addLayout(center)
+        row.addStretch(1)
+        root.addLayout(row)
+        root.addStretch(1)
+
+        # 底部：左下「更多」，右下版本号
         bottom = QHBoxLayout()
-        btn_more = QPushButton("⋯  更多")
+        btn_more = QPushButton("更多")
         btn_more.setCursor(Qt.PointingHandCursor)
         btn_more.setToolTip("作者介绍 / 更新 / 意见反馈 / 版本信息")
+        _bind_font(btn_more, 13)
         btn_more.setStyleSheet(
-            "QPushButton { font-size:14px; padding:8px 18px; border:1px solid #cfd8dc;"
-            " border-radius:8px; background:white; color:#607d8b; }"
-            "QPushButton:hover { background:#ecf0f1; color:#2c3e50; }"
+            f"QPushButton {{ background:transparent; border:none; border-radius:6px;"
+            f" padding:8px 12px; color:{self.ACCENT_DEEP}; }}"
+            f"QPushButton:hover {{ background:{self.ACCENT_SOFT}; }}"
         )
         btn_more.clicked.connect(lambda: self.main.go_to(self.main.more_page))
         bottom.addWidget(btn_more)
         bottom.addStretch(1)
-        layout.addLayout(bottom)
-        self.setLayout(layout)
+        ver = QLabel(f"v{APP_VERSION}")
+        _bind_font(ver, 12)
+        ver.setStyleSheet(f"color:{self.TEXT_SUB};")
+        bottom.addWidget(ver)
+        root.addLayout(bottom)
+
+    # ---------------- 组件 ----------------
+    @classmethod
+    def _icon_pixmap(cls, paths, size):
+        """首页图标：统一走模块级 `_svg_pixmap`，颜色用强调色系。"""
+        return _svg_pixmap(paths, cls.ACCENT_DEEP, size)
+
+    @classmethod
+    def _tile(cls, paths, name, desc, wide=False):
+        """一张磁贴按钮（圆形图标 + 标题 + 说明）。
+        wide=True 时占满两列（专项训练通栏用），高度略矮。"""
+        b = QPushButton()
+        b.setObjectName("homeTile")
+        b.setFixedSize(676 if wide else 330, 88 if wide else 104)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setStyleSheet(
+            f"#homeTile {{ background:{cls.CARD_BG}; border:1px solid {cls.CARD_BD};"
+            f" border-radius:14px; padding:0px; text-align:left; }}"
+            f"#homeTile:hover {{ background:#FAFEFF; border:1px solid {cls.ACCENT}; }}"
+            f"#homeTile:pressed {{ background:{cls.ACCENT_SOFT}; }}"
+        )
+        lay = QHBoxLayout(b)
+        lay.setContentsMargins(18, 0, 18, 0)
+        lay.setSpacing(14)
+
+        ic = QLabel()
+        ic.setObjectName("homeIconBox")
+        ic.setFixedSize(40, 40)
+        ic.setAlignment(Qt.AlignCenter)
+        ic.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        ic.setStyleSheet(
+            f"#homeIconBox {{ background:{cls.ACCENT_SOFT}; border-radius:20px; border:none; }}"
+        )
+        ic.setPixmap(cls._icon_pixmap(paths, 22))
+        lay.addWidget(ic)
+
+        txt = QVBoxLayout()
+        txt.setSpacing(3)
+        # ⚠️ 上下都要加 stretch：QLabel 默认垂直策略是 Preferred（可伸长），
+        # 不夹住的话 QVBoxLayout 会把多余高度分给两个 label，文字各自顶到框顶端，
+        # 于是标题和说明之间拉出一道很显眼的空行（用户截图里圈出来的就是这个）。
+        txt.addStretch(1)
+        t = QLabel(name)
+        _bind_font(t, 16, medium=True)      # 内部已 setFont，别在外面再套一层
+        t.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        t.setStyleSheet(f"color:{cls.TEXT}; background:transparent;")
+        d = QLabel(desc)
+        _bind_font(d, 12)
+        d.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        d.setStyleSheet(f"color:{cls.TEXT_SUB}; background:transparent;")
+        txt.addWidget(t)
+        txt.addWidget(d)
+        txt.addStretch(1)
+        tw = QWidget()
+        tw.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        tw.setLayout(txt)
+        lay.addWidget(tw, 1)
+        return b
 
     def load_and_start(self, mode):
         path, _ = QFileDialog.getOpenFileName(self, "选择 .solo 文件", "", "SoloTalk 文件 (*.solo)")
@@ -1138,9 +2049,18 @@ class HomePage(QWidget):
                 zf.extractall(temp_dir)
                 self.main.current_package.from_dict(data, base_dir=temp_dir)
                 self.main.current_package.meta['temp_dir'] = temp_dir
+            # 专项训练：先让用户选篇目，再按选定篇目裁剪题目包数据
+            if mode == "special":
+                dlg = SpecialPartsDialog(self.main.current_package, self)
+                if dlg.exec_() != QDialog.Accepted:
+                    return
+                parts = dlg.selected_parts()
+                if not parts:
+                    return
+                self.main.current_package.keep_only_parts(parts)
             # 先把题目包交给练习页，确保进度文件路径能取到正确的包名
             self.main.practice_page.pkg = self.main.current_package
-            self.main.practice_page.set_mode(mode)
+            self.main.practice_page.set_mode(mode, parts if mode == "special" else None)
             self.main.go_to(self.main.practice_page)
             # 进入后先检查该模式 + 该题包是否有“一半”的进度，再让用户选择继续或重新开始
             self.main.practice_page._check_and_prompt_progress()
@@ -1167,6 +2087,7 @@ class MorePage(QWidget):
     ICON_FILENAME = "xixi.ico"
 
     NAV_ITEMS = [
+        ("🎨", "个性化"),
         ("ℹ️", "关于"),
         ("⬆️", "更新&下载地址"),
         ("💬", "意见反馈"),
@@ -1242,6 +2163,7 @@ class MorePage(QWidget):
         rv.setSpacing(10)
 
         self.stack = QStackedWidget()
+        self.stack.addWidget(self._scroll(self._page_personalize()))
         self.stack.addWidget(self._scroll(self._page_about()))
         self.stack.addWidget(self._scroll(self._page_update()))
         self.stack.addWidget(self._scroll(self._page_feedback()))
@@ -1393,6 +2315,76 @@ class MorePage(QWidget):
         return row
 
     # ---------- 各板块 ----------
+    # ---------- 个性化 ----------
+    def _page_personalize(self):
+        """个性化设置：目前提供界面字体切换（立即生效 + 记住选择）。"""
+        w, v = self._page()
+
+        v.addWidget(self._sub("界面字体"))
+        v.addWidget(self._para(
+            "换一个你看着舒服的字体，改动立即生效，并会记到下次启动。", 13, "#6b7785"))
+
+        card = QFrame()
+        card.setObjectName("pfCard")
+        card.setStyleSheet(
+            "#pfCard { background:#ffffff; border:1px solid #e6ebef; border-radius:10px; }"
+        )
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(20, 18, 20, 18)
+        cv.setSpacing(12)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        lb = QLabel("字体")
+        lb.setStyleSheet("font-size:14px; color:#2c3e50;")
+        lb.setFixedWidth(self.LABEL_W)
+        row.addWidget(lb)
+
+        self.cmb_font = FluentSelect(min_width=300)
+        cur = _UI_FONT.get("choice")
+        sel = 0
+        for i, (label, fam) in enumerate(_available_font_choices()):
+            self.cmb_font.addItem(label, fam)
+            if fam == cur:
+                sel = i
+        self.cmb_font.setCurrentIndex(sel)
+        # 先设好当前项再接信号，避免构造期就触发一次保存
+        self.cmb_font.changed.connect(self._on_font_changed)
+        row.addWidget(self.cmb_font)
+        row.addStretch(1)
+        cv.addLayout(row)
+
+        pv = QLabel("预览")
+        pv.setStyleSheet("font-size:13px; color:#6b7785;")
+        cv.addWidget(pv)
+
+        prev = QFrame()
+        prev.setObjectName("pfPrev")
+        prev.setStyleSheet(
+            "#pfPrev { background:#f7f9fb; border:1px solid #eaf0f4; border-radius:8px; }"
+        )
+        pvv = QVBoxLayout(prev)
+        pvv.setContentsMargins(16, 14, 16, 14)
+        pvv.setSpacing(6)
+        for text, size_px, medium, color in (
+            ("SoloTalk 英语听说模考", 20, True, "#1a2b3c"),
+            ("Part A Reading Aloud　模仿朗读", 14, False, "#2c3e50"),
+            ("单机版英语听说模考编辑器 · 断网可用", 12, False, "#7a8a9a"),
+        ):
+            lb2 = QLabel(text)
+            _bind_font(lb2, size_px, medium=medium)
+            lb2.setStyleSheet(f"color:{color}; background:transparent;")
+            pvv.addWidget(lb2)
+        cv.addWidget(prev)
+
+        v.addWidget(card)
+        return w
+
+    def _on_font_changed(self, fam):
+        """字体下拉变更 → 立即应用 + 保存（失败时只打日志，不打断用户）。"""
+        if not self.main.set_ui_font(fam):
+            print("[FONT] ⚠️ 切换失败，字体保持原样")
+
     def _page_about(self):
         w, v = self._page()
 
@@ -2005,16 +2997,37 @@ class PracticePage(QWidget):
     signal_tts_next = pyqtSignal()
     signal_tts_file_ready = pyqtSignal(str)   # edge-tts 生成的音频文件就绪（主线程播放）
     signal_finished = pyqtSignal()
+    # VLC 的事件回调运行在 VLC 自己的线程里，**绝不能**在那里直接碰 Qt 对象
+    # （QTimer / QWidget 都只能在主线程用）。用信号转发回主线程再处理。
+    signal_vlc_playing = pyqtSignal()
+    signal_vlc_ended = pyqtSignal()
+
+    # ---- 模式与专项训练 ----
+    # special（专项训练）：与 practice 一样可用跳过/上一步，但【免试音】、只跑选定篇目，
+    # 进度/历史与 练习/模考 完全隔离（进度文件名含篇目键，历史记录带 mode+parts）。
+    _MODE_TEXT = {"practice": "练习", "exam": "模考", "special": "专项训练"}
+    _PART_ORDER = ("partA", "partB", "partC")
+    _PART_LETTER = {"partA": "A", "partB": "B", "partC": "C"}
 
     def __init__(self, main_window):
         super().__init__()
         self.main = main_window
         self.pkg = None
         self.session = None
-        # 关闭硬件解码与 OSD，减少 Windows 下嵌入 VLC 时 Direct3D 与主线程消息循环冲突导致的"未响应"
-        self.vlc_instance = vlc.Instance(
-            "--no-video-title-show --no-osd --no-snapshot-preview --avcodec-hw=none"
-        )
+        # 关闭 OSD / 标题等，减少 Windows 下嵌入 VLC 时 Direct3D 与主线程消息循环的冲突。
+        # ⚠️ 传参必须用**列表**：python-vlc 把单个字符串当成「一个」参数，
+        #    写成 "--a --b" 时后面所有选项都会被吞掉。
+        # ⚠️ 但注意：这里的 --avcodec-hw=none 对 VLC 3.0 的 D3D11VA **实测无效**
+        #    （日志仍出现 "Using D3D11VA ... for hardware decoding"）。
+        #    真正能禁用硬解的是 **媒体级** 选项，见 `_make_media()`：
+        #        media.add_option(":avcodec-hw=none")
+        #    这里的参数保留作兜底（万一某些版本认它），真正的开关在 _make_media。
+        self.vlc_instance = vlc.Instance([
+            "--no-video-title-show",
+            "--no-osd",
+            "--no-snapshot-preview",
+            "--avcodec-hw=none",          # ⚠️ Instance 级实测无效，真正生效的是 _make_media 的 media 级选项
+        ])
         if self.vlc_instance is None:
             raise RuntimeError(
                 "VLC 初始化失败：无法创建 vlc.Instance()。\n"
@@ -2038,16 +3051,22 @@ class PracticePage(QWidget):
         self._exam_active = False
         self._resume_cp = None  # 练习模式恢复进度时，mic 测试通过后跳到的重进点
         self.mode = "practice"
+        self.selected_parts = {"A", "B", "C"}  # 专项训练选定的篇目；练习/模考恒为全部
         self._b_moments = []
         self._win_key_blocker = None
         self._fullscreen = False
         # VLC 视频嵌入到 Qt 的 video_frame（set_hwnd）；点击由 _disable_vlc_input 禁用其输入
         self._vlc_parent_hwnd = None
-        self.player.event_manager().event_attach(vlc.EventType.MediaPlayerEndReached, self._on_vlc_end)
-        # 每次真正开始播放后，重新禁用视频子窗口输入（VLC 可能在 play 时重建窗口）
+        # ⚠️ 这两个事件的回调都在 VLC 线程里跑：只能 emit 信号（线程安全），
+        #    由 Qt 队列回主线程执行真正的处理 —— 直接调 QTimer.singleShot 会得到
+        #    "QObject::startTimer: Timers can only be used with threads started with QThread"
+        #    并可能让定时器在错误线程触发 → 播放中闪退。
+        self.signal_vlc_playing.connect(self._on_vlc_playing)
+        self.signal_vlc_ended.connect(self._on_vlc_ended)
         self.player.event_manager().event_attach(
-            vlc.EventType.MediaPlayerPlaying,
-            lambda e: QTimer.singleShot(50, self._disable_vlc_input))
+            vlc.EventType.MediaPlayerPlaying, lambda e: self.signal_vlc_playing.emit())
+        self.player.event_manager().event_attach(
+            vlc.EventType.MediaPlayerEndReached, lambda e: self.signal_vlc_ended.emit())
 
         self.setup_ui()
         self.signal_update_display.connect(self._update_display)
@@ -2077,6 +3096,14 @@ class PracticePage(QWidget):
         _grid.setContentsMargins(0, 0, 0, 0)
         self.video_frame = QFrame()
         self.video_frame.setStyleSheet("background:black;")
+        # ⚠️ 让 Qt 一开始就把 video_frame 建成原生窗口：
+        # 普通 QFrame 的 winId() 是 Qt **隐式**创建的，reparent / 显示隐藏 / 全屏切换
+        # 都可能把它销毁重建 → 句柄变了 → VLC 被迫销毁并重建整个 vout
+        # （每次都要新建 D3D11 设备 + 分配 surface 池，实测一次播放建 2~3 个），
+        # 而 vout 越多，stop() 收尾越慢（实测 484 / 821 / 1273 ms）。
+        # WA_DontCreateNativeAncestors：别把祖先也变成原生窗口，减少句柄变动面。
+        self.video_frame.setAttribute(Qt.WA_NativeWindow, True)
+        self.video_frame.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
         _grid.addWidget(self.video_frame, 0, 0)
         self.text_display = QTextEdit()
         self.text_display.setReadOnly(True)
@@ -2148,8 +3175,10 @@ class PracticePage(QWidget):
     def request_exit(self):
         """返回 True 表示允许退出（已确认或无需确认）。
 
-        卡死的根因在 `_stop_video()`：VLC 未解除与 Qt 原生窗口的绑定就 stop() 会死锁。
-        这里不再额外暂停播放——VLC 的暂停/解绑/停止统一交给 `_stop_video()` 处理。"""
+        ⚠️ 这里**不要**额外做「解绑嵌入窗口」（`set_hwnd(0)`）来"帮助"停止：
+        实测 Windows 上 set_hwnd(0) 不解绑，反而让 VLC 把视频窗口重挂到桌面、
+        销毁并重建整个 vout（D3D11 设备 + surface 池），stop() 直接慢 3 倍。
+        停止一律交给 `_stop_video()`（内部在后台线程 stop，主线程只等 50ms 就走）。"""
         if self._exam_active:
             if not self._confirm_abort():
                 return False
@@ -2165,7 +3194,7 @@ class PracticePage(QWidget):
         self._cancel_tts()
         if self._tts_thread and self._tts_thread.is_alive():
             self._tts_thread.join(timeout=0.5)
-        # 同步停止 VLC（内部顺序：暂停 → 解绑嵌入窗口 → stop）
+        # 停止 VLC（后台线程 stop，主线程只等 50ms，不会拖住退出流程）
         self._stop_video()
         self.player.audio_set_volume(100)
         # 先把正在录的音保存下来，再把进度写入文件
@@ -2196,7 +3225,7 @@ class PracticePage(QWidget):
         self.recording_overlay.hide()
         self._stop_video()
         self.display_stack.setCurrentWidget(self.text_display)
-        self.main_label.setText("准备开始" + ("模考" if self.mode == "exam" else "练习"))
+        self.main_label.setText("准备开始" + self._mode_text())
         self.sub_label.setText("")
         self._stop_parse_timer()
         self._parse_media = None
@@ -2233,12 +3262,16 @@ class PracticePage(QWidget):
     # ---------- 进度保存 / 恢复 ----------
     def _progress_file_path(self):
         """返回当前模式 + 当前题目包对应的进度文件路径。
-        模式与题目包分别编码进文件名，练习/模考进度天然隔离、不会混用。"""
+        模式与题目包分别编码进文件名，练习/模考/专项进度天然隔离、不会混用。
+        专项训练还会把选定篇目编码进文件名（如 progress_special_AB_包名.json），
+        使 A-only / B-only / AB 等组合的进度互不干扰。"""
         pkg = self.pkg or getattr(self.main, "current_package", None)
         pkg_name = pkg.meta.get("name", "untitled") if pkg else "untitled"
         safe = "".join(c for c in pkg_name if c.isalnum() or c in (" ", "-", "_")).rstrip().replace(" ", "_")
         if not safe:
             safe = "untitled"
+        if self.mode == "special":
+            return os.path.join(HISTORY_DIR, f"progress_special_{self._parts_key()}_{safe}.json")
         return os.path.join(HISTORY_DIR, f"progress_{self.mode}_{safe}.json")
 
     def _save_progress(self):
@@ -2258,6 +3291,7 @@ class PracticePage(QWidget):
                 "mic_test_active": self._current_phase == "mic" and getattr(self, "_is_recording", False),
                 "prepare_text": getattr(self, "_prepare_text", ""),
                 "video_duration": getattr(self, "video_duration", 60),
+                "parts": sorted(self.selected_parts),
                 "recordings": {
                     "partA": self.session.partA_recording,
                     "partB": self.session.partB_slots,
@@ -2319,7 +3353,7 @@ class PracticePage(QWidget):
 
     def _describe_progress(self, data):
         """把进度数据转成给用户看的简短摘要（用于恢复对话框）。"""
-        mode_text = "模考" if data.get("mode") == "exam" else "练习"
+        mode_text = self._MODE_TEXT.get(data.get("mode"), "练习")
         phase_map = {"mic": "试音阶段", "partA": "A 篇", "partB": "B 篇", "partC": "C 篇"}
         phase = phase_map.get(data.get("phase", ""), data.get("phase", "未知"))
         ts = data.get("timestamp", "")
@@ -2331,7 +3365,11 @@ class PracticePage(QWidget):
         if recs.get("partC"):
             n += 1
         n += len([v for v in (recs.get("partB") or {}).values() if v])
-        return (f"模式：{mode_text}\n当前位置：{phase}\n"
+        parts = data.get("parts")
+        part_line = ""
+        if data.get("mode") == "special" and parts:
+            part_line = "训练篇目：" + "、".join(f"Part {p}" for p in parts) + "\n"
+        return (f"模式：{mode_text}\n{part_line}当前位置：{phase}\n"
                 f"已录音：{n} 段\n保存时间：{ts_show}")
 
     def _check_and_prompt_progress(self):
@@ -2341,7 +3379,7 @@ class PracticePage(QWidget):
         saved = self._load_progress()
         if not saved:
             return
-        mode_text = "模考" if self.mode == "exam" else "练习"
+        mode_text = self._mode_text()
         desc = self._describe_progress(saved)
         msg = QMessageBox(self)
         msg.setWindowTitle("恢复进度")
@@ -2356,7 +3394,7 @@ class PracticePage(QWidget):
         elif clicked == btn_restart:
             # 重新开始：清除进度文件与已录制音频，回到开考前初始状态
             self._clear_progress(delete_recordings=True)
-            self.start_btn.setText("开始" + mode_text)
+            self.start_btn.setText("开始" + self._mode_text())
             self._update_nav_buttons()
         # 若用户直接关闭对话框（未选择），保持当前初始状态，进度文件保留供下次处理
 
@@ -2376,6 +3414,12 @@ class PracticePage(QWidget):
         self.session.partB_slots = recs.get("partB", {}) or {}
         self.session.partC_recording = recs.get("partC")
 
+        # 专项训练：先还原「上次选定的篇目」，重进目标才能正确按篇目过滤
+        if self.mode == "special":
+            saved_parts = data.get("parts")
+            if saved_parts:
+                self.selected_parts = set(saved_parts)
+
         self._exam_active = True
         self.start_btn.setEnabled(False)
         self._update_nav_buttons()
@@ -2385,6 +3429,7 @@ class PracticePage(QWidget):
 
         phase = data.get("phase")
         # 试音阶段：如果上次正在录音，直接回到试音录音；否则从头准备
+        # （专项训练不会进入试音阶段，这里仅练习/模考会命中）
         if phase == "mic":
             self._prepare_text = data.get("prepare_text", "")
             if data.get("mic_test_active"):
@@ -2414,8 +3459,12 @@ class PracticePage(QWidget):
             target = ("partC", 0)              # 始终从 C 开头开始
         else:
             target = ("partA", 0)
+        # 兜底：若重进目标篇目不在本次选定范围内（数据异常），退回首个选定篇目
+        if not self._phase_selected(target[0]):
+            first = self._first_selected_part()
+            target = (first, 0) if first else ("partA", 0)
 
-        # 直接跳到重进点（练习/模考统一，不重复 mic 测试）
+        # 直接跳到重进点（练习/模考/专项统一，专项不重复 mic 测试）
         self._go_to_checkpoint(target, replay=True)
 
     # ---------- 检查点表（来自页面清单 Excel 列 G / 列 H） ----------
@@ -2640,28 +3689,99 @@ class PracticePage(QWidget):
         rec = getattr(self, "_is_recording", False)
         # 跳过按钮：考试中始终可用；录音中它化身「结束录音」（见 _update_skip_label）
         self.skip_btn.setEnabled(active)
-        # 上一步按钮：仅在 试音开头 / A-intro / 录音中 禁用
+        # 上一步按钮：仅在 试音开头 / 首篇开头 / 录音中 禁用
         can_prev = active and not rec
         if can_prev:
             phase = getattr(self, "_current_phase", "")
             if phase == "mic":
                 can_prev = False                      # 1. 试音/准备阶段
-            elif phase == "partA" and self._cur_step() == 0:
+            elif phase == "partA" and self._cur_step() == 0 and self.mode != "special":
                 can_prev = False                      # 2. A-intro 开头介绍
-            # 其他情况（A 段其余、B 段、C 段）保持可用
+            elif self._prev_allowed_target(phase, self._cur_step()) is None:
+                can_prev = False                      # 3. 已是首个选定篇目的开头（专项关键路径）
         self.prev_btn.setEnabled(can_prev)
         self._update_skip_label()
 
-    def set_mode(self, mode):
+    def _mode_text(self):
+        """当前模式的中文名（练习 / 模考 / 专项训练）。"""
+        return self._MODE_TEXT.get(self.mode, "练习")
+
+    def set_mode(self, mode, parts=None):
         """设置模式：
         - 'practice' 练习模式：可跳过 / 上一步，开头试音也能跳过；
-        - 'exam'    模考模式：跳过 / 上一步 均禁用且隐藏，试音也不能跳过。"""
+        - 'exam'    模考模式：跳过 / 上一步 均禁用且隐藏，试音也不能跳过；
+        - 'special' 专项训练：可跳过 / 上一步，免试音，只跑 parts 选定的篇目。"""
         self.mode = mode
-        if mode == "practice":
-            self.start_btn.setText("开始练习")
+        if mode == "special":
+            if parts:
+                self.selected_parts = set(parts)
         else:
-            self.start_btn.setText("开始模考")
+            self.selected_parts = {"A", "B", "C"}   # 练习/模考永远是完整流程
+        self.start_btn.setText("开始" + self._mode_text())
         self._reset_page_state()
+
+    # ---- 专项训练：篇目选择与流转 ----
+    def _parts_key(self):
+        """选定篇目的紧凑键（如 'AB' / 'C'），用于进度文件名区分不同组合。"""
+        return "".join(sorted(self.selected_parts)) or "none"
+
+    def _phase_selected(self, phase):
+        """该阶段（partA/partB/partC）是否在本次训练范围内。非专项模式恒为 True。"""
+        if self.mode != "special":
+            return True
+        return self._PART_LETTER.get(phase, "") in self.selected_parts
+
+    def _first_selected_part(self):
+        for ph in self._PART_ORDER:
+            if self._phase_selected(ph):
+                return ph
+        return None
+
+    def _next_selected_part_after(self, phase):
+        """按 A→B→C 顺序，返回 phase 之后第一个被选定的篇目；没有则 None。"""
+        seen = False
+        for ph in self._PART_ORDER:
+            if ph == phase:
+                seen = True
+                continue
+            if seen and self._phase_selected(ph):
+                return ph
+        return None
+
+    def _start_part_phase(self, phase):
+        if phase == "partA":
+            self._run_part_a()
+        elif phase == "partB":
+            self._run_part_b()
+        elif phase == "partC":
+            self._run_part_c()
+
+    def _start_first_selected_part(self):
+        """进入第一个选定篇目（专项模式开考入口；练习/模考等价于 Part A）。"""
+        first = self._first_selected_part()
+        if first is None:
+            self._reset_page_state()
+            QMessageBox.warning(self, "专项训练", "请先选择要训练的篇目（A / B / C）")
+            return
+        self._start_part_phase(first)
+
+    def _advance_after_part(self, phase):
+        """某篇目正常走完后的去向：下一选定篇目，或结束考试。"""
+        nxt = self._next_selected_part_after(phase)
+        if nxt:
+            self._start_part_phase(nxt)
+        else:
+            self.signal_finished.emit()
+
+    def _prev_allowed_target(self, phase, step):
+        """「上一步」目标（按选定篇目过滤）：目标篇目未选时继续向上找，
+        找不到（已是首个选定篇目的开头）返回 None —— 按钮应置灰。"""
+        prev = self._find_prev_checkpoint(self._PREV_CHECKPOINTS, phase, step)
+        for _ in range(16):     # 表只有 11 行，16 次足够兜底防死循环
+            if prev is None or self._phase_selected(prev[0]):
+                return prev
+            prev = self._find_prev_checkpoint(self._PREV_CHECKPOINTS, prev[0], prev[1])
+        return None
 
     def start_exam(self):
         """从“开始”按钮触发：以全新状态开考（进度检查/恢复已在进入页面时处理）。"""
@@ -2673,7 +3793,11 @@ class PracticePage(QWidget):
         if self.mode == "exam":
             self._enter_fullscreen()
             self._block_windows_key()
-        self._prepare_phase()
+        if self.mode == "special":
+            # 专项训练：免试音，直接进入第一个选定篇目
+            self._start_first_selected_part()
+        else:
+            self._prepare_phase()
 
     def _prepare_phase(self):
         self._current_phase = "mic"   # 开头试音阶段（准备 + 麦克风测试）
@@ -2706,19 +3830,19 @@ class PracticePage(QWidget):
         test_path = self._save_recording("mic_test")
         if os.path.exists(test_path):
             # 练习/模考统一：播放录音 → 弹窗确认 → 进入 Part A
-            media = self.vlc_instance.media_new(test_path)
+            media = self._make_media(test_path)
             self.player.set_media(media)
             self.player.play()
             reply = QMessageBox.question(self, "麦克风测试", "录音回放中，麦克风是否正常？",
                                          QMessageBox.Yes | QMessageBox.No)
-            self.player.stop()
+            self._stop_video()
             if reply == QMessageBox.Yes:
                 try:
                     os.remove(test_path)
                 except:
                     pass
-                self.signal_update_display.emit("准备开始", "即将开始" + ("模考" if self.mode == "exam" else "练习"))
-                self._set_timer(3, self._run_part_a)
+                self.signal_update_display.emit("准备开始", "即将开始" + self._mode_text())
+                self._set_timer(3, self._start_first_selected_part)
             else:
                 try:
                     os.remove(test_path)
@@ -2731,7 +3855,7 @@ class PracticePage(QWidget):
 
     def _player_play_then(self, media_path, callback):
         """回放音频，结束后回调（自动清理临时文件）。"""
-        self.player.set_media(self.vlc_instance.media_new(media_path))
+        self.player.set_media(self._make_media(media_path))
         self.player.play()
         m = self.player.get_media()
         duration = 0
@@ -2744,7 +3868,7 @@ class PracticePage(QWidget):
         self._set_timer(wait_ms / 1000.0, lambda: self._on_playback_done(media_path, callback))
 
     def _on_playback_done(self, media_path, callback):
-        self.player.stop()
+        self._stop_video()
         try:
             os.remove(media_path)
         except Exception:
@@ -2764,11 +3888,11 @@ class PracticePage(QWidget):
     def _speak_or_play_audio(self, text, audio_path, callback):
         """优先播放音频文件，否则用 TTS 朗读文本；播放/朗读结束后触发 callback。
 
-        Part B / Part C 共用：有音频且文件存在 → VLC 播放（结束回调 _on_vlc_end）；
+        Part B / Part C 共用：有音频且文件存在 → VLC 播放（结束回调 _on_vlc_ended）；
         否则 → TTS 朗读（结束回调 _on_tts_next）。"""
         if audio_path and os.path.exists(audio_path):
             self._audio_callback = callback
-            media = self.vlc_instance.media_new(audio_path)
+            media = self._make_media(audio_path)
             self.player.set_media(media)
             self.player.play()
             self.display_stack.setCurrentWidget(self.text_display)  # 只播声音，停在文本区
@@ -2787,7 +3911,7 @@ class PracticePage(QWidget):
         resolved = _resolve_resource_file(path)
         if resolved and os.path.isfile(resolved):
             self._audio_callback = callback
-            media = self.vlc_instance.media_new(resolved)
+            media = self._make_media(resolved)
             self.player.set_media(media)
             self.player.play()
             self.display_stack.setCurrentWidget(self.text_display)
@@ -2815,7 +3939,7 @@ class PracticePage(QWidget):
                 if not fired[0]:
                     fired[0] = True
                     callback()
-            self.player.set_media(self.vlc_instance.media_new(resolved))
+            self.player.set_media(self._make_media(resolved))
             self.player.play()
             QTimer.singleShot(80, lambda: self._delayed_set_volume(100))
             # 用 duration + 缓冲 定时器触发回调（不依赖 EndReached 事件）
@@ -2850,7 +3974,7 @@ class PracticePage(QWidget):
             signal.emit()
 
     def _on_tts_file_ready(self, path):
-        """主线程：播放 edge-tts 生成的音频，播完由 _on_vlc_end 触发 _tts_file_done。"""
+        """主线程：播放 edge-tts 生成的音频，播完由 _on_vlc_ended 触发 _tts_file_done。"""
         if self._teardown_done:
             return
         if not path or not os.path.exists(path):
@@ -2861,7 +3985,7 @@ class PracticePage(QWidget):
                 sig.emit()
             return
         self._audio_callback = self._tts_file_done
-        media = self.vlc_instance.media_new(path)
+        media = self._make_media(path)
         self.player.set_media(media)
         self.player.play()
         self.display_stack.setCurrentWidget(self.text_display)  # 只播声音，停在文本区
@@ -2913,7 +4037,7 @@ class PracticePage(QWidget):
             return
         # 先给一个兜底时长，避免解析卡住时界面无响应
         self.video_duration = 60
-        self._parse_media = self.vlc_instance.media_new(video_path)
+        self._parse_media = self._make_media(video_path)
         # 异步解析，不阻塞主线程消息循环
         self._parse_media.parse_with_options(vlc.MediaParseFlag.local, 5000)
         self.signal_update_display.emit("加载视频", "正在解析视频时长...")
@@ -2994,7 +4118,7 @@ class PracticePage(QWidget):
             self._stop_video()
             self._stop_recording()
             self.session.partA_recording = self._save_recording("PartA")
-            self._run_part_b()
+            self._advance_after_part("partA")
 
     def _begin_partA_record(self):
         """Part A 开始录音（滴声结束后调用）。"""
@@ -3058,7 +4182,7 @@ class PracticePage(QWidget):
     def _exec_partB_step(self, replay=False):
         self._update_nav_buttons()  # 每步切换时刷新导航按钮
         if self._b_step >= len(self._b_moments):
-            self._run_part_c()
+            self._advance_after_part("partB")
             return
         self._exec_b_moment(self._b_moments[self._b_step], replay)
 
@@ -3168,7 +4292,7 @@ class PracticePage(QWidget):
             else:
                 if self.pkg.partC_audio_path and os.path.exists(self.pkg.partC_audio_path):
                     self._audio_callback = self._next_partC_step
-                    media = self.vlc_instance.media_new(self.pkg.partC_audio_path)
+                    media = self._make_media(self.pkg.partC_audio_path)
                     self.player.set_media(media)
                     self.player.play()
                     self.display_stack.setCurrentWidget(self.text_display)  # 只播声音，停在文本区
@@ -3195,7 +4319,21 @@ class PracticePage(QWidget):
             self.session.partC_recording = self._save_recording("PartC")
             self.signal_finished.emit()
 
-    def _on_vlc_end(self, event):
+    def _on_vlc_playing(self):
+        """（主线程）VLC 真正起播 —— VLC 会在这时重建视频子窗口，重新禁用其输入。
+
+        ⚠️ 这是 `signal_vlc_playing` 的槽，**必须**跑在主线程：
+        VLC 的 MediaPlayerPlaying 事件由 VLC 内部线程发出，回调里不能直接碰 Qt。"""
+        QTimer.singleShot(50, self._disable_vlc_input)
+
+    def _on_vlc_ended(self):
+        """（主线程）VLC 播放结束。
+
+        ⚠️ 由 `signal_vlc_ended` 从 VLC 线程转发过来。原实现在 VLC 线程里直接
+        `QTimer.singleShot(0, cb)`，会创建"挂在 VLC 线程上的定时器"（该线程没有 Qt
+        事件循环），既刷 `QObject::startTimer ...` 警告，又可能让后续步骤在错误线程
+        操作界面而闪退。现在统一由主线程处理。
+        """
         if self._teardown_done:
             return
         # 避免在准备阶段等非视频阶段触发异常回调
@@ -3353,8 +4491,8 @@ class PracticePage(QWidget):
                 pass
 
     def _skip_current(self):
-        """跳过：跳到下一个录音点 / 跳过开头试音（0.4s 缓冲，不显示）。仅练习模式可用。"""
-        if self.mode != "practice":
+        """跳过：跳到下一个录音点 / 跳过开头试音（0.4s 缓冲，不显示）。练习/专项可用。"""
+        if self.mode == "exam":
             return
         if self._current_phase not in ("mic", "partA", "partB", "partC"):
             return
@@ -3369,17 +4507,20 @@ class PracticePage(QWidget):
             if self._teardown_done or not self._exam_active:
                 return
             if self._current_phase == "mic":
-                # 练习模式：跳过开头试音，直接进入 Part A
+                # 练习/专项：跳过开头试音，直接进入首个选定篇目
                 self._stop_recording()
-                self.player.stop()
-                self.player.audio_set_volume(100)
-                self._run_part_a()
+                self._stop_video()
+                self._start_first_selected_part()
                 return
             # 按 Excel 第 9 列「跳过/结束录音」落点表前进
             target = self._SKIP_NEXT.get((self._current_phase, self._cur_step()))
             if target is None:
                 # 兜底：沿用旧逻辑前进一步
                 target = self._next_checkpoint(self._current_phase, self._cur_step())
+            # 专项训练：跳过目标若落在未选篇目上，顺延到下一个选定篇目，或结束
+            if isinstance(target, tuple) and not self._phase_selected(target[0]):
+                nxt = self._next_selected_part_after(target[0])
+                target = (nxt, 0) if nxt else "FINISH"
             if target is None or target == "FINISH":
                 # 已是最后一页（C-record 结束录音批改），结束考试
                 # 当前录音已在 _cleanup_for_nav 中保存
@@ -3390,9 +4531,9 @@ class PracticePage(QWidget):
             self._navigating = False
 
     def _prev_current(self):
-        """上一步：跳到上一个检查点重新开始。仅练习模式可用。
+        """上一步：跳到上一个检查点重新开始。练习/专项可用。
         准备阶段/录音中不可用（按钮已置灰，此处为守卫）。"""
-        if self.mode != "practice":
+        if self.mode == "exam":
             return
         if self._current_phase not in ("partA", "partB", "partC"):
             return
@@ -3408,9 +4549,9 @@ class PracticePage(QWidget):
         try:
             if self._teardown_done or not self._exam_active:
                 return
-            prev = self._prev_checkpoint(self._current_phase, self._cur_step())
+            prev = self._prev_allowed_target(self._current_phase, self._cur_step())
             if prev is None:
-                return          # 已是第一个录音点，无法回退
+                return          # 已是首个选定篇目的开头，无法回退
             self._go_to_checkpoint(prev, replay=True)
         finally:
             self._navigating = False
@@ -3426,6 +4567,23 @@ class PracticePage(QWidget):
             self.text_display.setPlainText(sub if sub else main)
 
     # ---------- 视频控制（VLC 嵌入 Qt 的 video_frame，禁用点击输入）----------
+    def _make_media(self, path_or_mrl):
+        """创建 VLC media，并在**媒体级**关闭硬件解码。
+
+        ⚠️ 必须加在 media 上：`vlc.Instance(["--avcodec-hw=none"])` 对 VLC 3.0 的 D3D11VA
+        硬解**实测无效**（日志里仍出现 "Using D3D11VA ... for hardware decoding"），
+        只有 media 级选项 `:avcodec-hw=none` 才真正禁用。
+        启用硬解时，停止/解绑嵌入窗口会持续刷
+        `h264 get_buffer() failed / thread_get_buffer() failed`，
+        并且 D3D11 硬解与 Qt 的 D3D 设备争用，是「播放/切页未响应」的已知诱因。
+        """
+        m = self.vlc_instance.media_new(path_or_mrl)
+        try:
+            m.add_option(":avcodec-hw=none")
+        except Exception:
+            pass
+        return m
+
     def _start_vlc_playback(self, media, silent=False, show_window=True):
         """统一播放：把 VLC 视频嵌入到 Qt 的 video_frame 控件里（set_hwnd）。
         show_window=True 时切换到视频区显示；False 时只播声音，停留在文本区。
@@ -3433,6 +4591,19 @@ class PracticePage(QWidget):
         这是修复"点击视频导致主线程卡死/未响应"的关键。"""
         if self._teardown_done:
             return
+        # ⚠️ 防「双解码器」：上一次播放若还没停干净（state 仍是 Playing/Paused），
+        #    直接 set_media() 会在旧解码管线尚未释放时新建一条，两条 h264 解码器
+        #    同时抢核显的 surface 池（表现为 `get_buffer() failed` 刷屏）。先停干净再播。
+        #    起播即作废任何还在后台跑的停止操作（防止它把这次新播放给停掉）
+        self._vlc_gen = getattr(self, "_vlc_gen", 0) + 1
+        try:
+            if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
+                # 已经有一个后台停止在跑就别再叠一个（_stop_video 只等 50ms，
+                # 快速连点时很容易出现两个 stop 同时操作 player）。
+                if getattr(self, "_vlc_stop_pending", 0) == 0:
+                    self._stop_video()
+        except Exception:
+            pass
         if show_window and self.display_stack.currentWidget() != self.video_container:
             self.display_stack.setCurrentWidget(self.video_container)
         # 始终把 VLC 绑定到 video_frame —— 即使该控件当前被隐藏（如 Part A「听录音」：
@@ -3440,13 +4611,22 @@ class PracticePage(QWidget):
         # 只要 VLC 手里有一个嵌入窗口可画，它就**绝不会**另开独立的
         # 「VLC (Direct3D11 output)」窗口；此时画面被画进隐藏控件里，肉眼看不见。
         # （此前用 isVisible() 判断，隐藏时不绑定 → 一旦 _stop_video 解绑过，就会冒出独立窗口。）
+        #
+        # ⚠️ 但只在**句柄真的变了**时才 set_hwnd（2026-09-26）：
+        # 每次播放都重复 set_hwnd 会让 VLC 销毁并重建 vout（实测一次播放建 2~3 个 vout，
+        # 每个都要新建 D3D11 设备 + surface 池），vout 越多 stop() 收尾越慢（实测最高 1273ms）。
+        # 句柄没变时跳过，VLC 会复用现有 vout（日志里表现为 "reusing provided vout"）。
+        # `_vlc_bound_hwnd` 记的是 **VLC 实际绑着的**句柄，与 `_vlc_parent_hwnd`（仅用于
+        # 枚举子窗口、stop 后置 None）分开记：stop 后 VLC 仍然绑着同一个 hwnd，不能误判成"需要重绑"。
         try:
             hwnd = int(self.video_frame.winId())
             # 简单验证句柄是否有效（非零且窗口存在）
             if sys.platform == "win32" and hwnd:
                 if ctypes.windll.user32.IsWindow(hwnd):
                     self._vlc_parent_hwnd = hwnd
-                    self.player.set_hwnd(hwnd)
+                    if hwnd != getattr(self, "_vlc_bound_hwnd", None):
+                        self.player.set_hwnd(hwnd)
+                        self._vlc_bound_hwnd = hwnd
                 else:
                     self._vlc_parent_hwnd = None
             else:
@@ -3461,7 +4641,9 @@ class PracticePage(QWidget):
         QTimer.singleShot(150, self._disable_vlc_input)
 
     def _delayed_set_volume(self, vol):
-        """播放后延迟设音量（teardown 守卫）"""
+        """播放后延迟设音量（teardown 守卫）。
+
+        play() 之后立刻设音量会被 VLC 起播流程覆盖，所以延后 80ms 再设一次。"""
         if self._teardown_done:
             return
         try:
@@ -3470,14 +4652,44 @@ class PracticePage(QWidget):
             pass
 
     def _disable_vlc_input(self):
-        """禁用 VLC 视频子窗口的输入（鼠标/键盘），让"点击视频"彻底无效，不再触发卡死。"""
+        """安排一次「禁用 VLC 视频子窗口输入」——**真正的活放在后台线程**。
+
+        ⚠️ 真正的活必须放后台线程：**不要搬回主线程**。
+        它对 VLC 的视频子窗口调 `SetWindowLongW`，而那个窗口属于 VLC 的 **vout 线程**；
+        跨线程 `SetWindowLongW` 内部是同步 `SendMessage`，必须等 vout 线程处理完消息才返回。
+        1080p 视频起播时 VLC 会连建 2~3 次 vout（每次都要新建 D3D11 设备 + 分配 surface 池），
+        vout 线程此时忙 → 主线程会死等 → 窗口「未响应」。
+        放到 daemon 线程后，最坏情况只是这个后台线程卡住，界面完全不受影响。
+        （注：2026-09-19 那次「返回主页未响应」的元凶不是它，是 `_stop_video` 里的
+        `stop()`，已单独修；这里的线程化是同类风险的预防，一并保留。）
+        """
         if self._teardown_done:
             return
         if sys.platform != "win32" or not self._vlc_parent_hwnd:
             return
+        parent = self._vlc_parent_hwnd
+        # 已有一次在处理中就不再起新线程（也顺带防止后台线程堆积）
+        if getattr(self, "_vlc_input_busy", False):
+            return
+        self._vlc_input_busy = True
+
+        def _run():
+            try:
+                self._disable_vlc_input_worker(parent)
+            except Exception:
+                pass
+            finally:
+                self._vlc_input_busy = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _disable_vlc_input_worker(self, parent_hwnd):
+        """后台线程：给 VLC 的视频子窗口加 WS_DISABLED，让"点击视频"无效。"""
         # 再次验证父窗口句柄是否仍然有效（阶段切换后可能已销毁）
-        if not ctypes.windll.user32.IsWindow(self._vlc_parent_hwnd):
-            self._vlc_parent_hwnd = None
+        try:
+            if not ctypes.windll.user32.IsWindow(parent_hwnd):
+                return
+        except Exception:
             return
         try:
             user32 = ctypes.windll.user32
@@ -3495,7 +4707,7 @@ class PracticePage(QWidget):
                     results.append(hwnd)
                 return 1
 
-            user32.EnumChildWindows(self._vlc_parent_hwnd, enum_child, 0)
+            user32.EnumChildWindows(parent_hwnd, enum_child, 0)
             for hwnd in results:
                 style = user32.GetWindowLongW(hwnd, GWL_STYLE)
                 if not (style & WS_DISABLED):
@@ -3504,56 +4716,92 @@ class PracticePage(QWidget):
             pass
 
     def _play_video_full(self):
-        media = self.vlc_instance.media_new(self.pkg.partA_video_path)
+        media = self._make_media(self.pkg.partA_video_path)
         self._start_vlc_playback(media, silent=False, show_window=True)
 
     def _play_video_audio_only(self):
-        media = self.vlc_instance.media_new(self.pkg.partA_video_path)
+        media = self._make_media(self.pkg.partA_video_path)
         self._start_vlc_playback(media, silent=False, show_window=False)
         self.display_stack.setCurrentWidget(self.text_display)
 
     def _play_video_silent(self):
-        media = self.vlc_instance.media_new(self.pkg.partA_video_path)
+        media = self._make_media(self.pkg.partA_video_path)
         self._start_vlc_playback(media, silent=True, show_window=True)
 
     def _stop_video(self):
-        # 同步停止，避免 QTimer.singleShot(0, ...) 的停止事件排在新 play() 之后，
-        # 导致刚启动的音视频（如 Part A 的"听录音"音频-only 步骤）被立即停掉。
-        #
-        # ⚠️ 顺序很关键：先暂停 → 再解绑嵌入窗口(set_hwnd(0)) → 最后 stop()。
-        # 若直接 stop()，VLC 的视频输出线程(vout)仍绑定在 Qt 原生窗口(video_frame)上，
-        # 它会在 GUI 线程上死等，窗口随即「未响应」（返回主页时必现）。
-        try:
-            self.player.set_pause(1)
-        except Exception:
-            pass
-        try:
-            self.player.set_hwnd(0)   # 先解绑嵌入窗口，再 stop
-            self._vlc_parent_hwnd = None
-        except Exception:
-            pass
-        try:
-            self.player.stop()
-        except Exception:
-            pass
-        # 清空媒体，防止旧媒体的 EndReached 事件在阶段切换后仍触发回调
-        try:
-            self.player.set_media(None)
-        except Exception:
-            pass
-        try:
-            self.player.audio_set_volume(100)
-        except Exception:
-            pass
-        # 清空媒体，防止旧媒体的 EndReached 事件在阶段切换后仍触发回调
-        try:
-            self.player.set_media(None)
-        except Exception:
-            pass
-        try:
-            self.player.audio_set_volume(100)
-        except Exception:
-            pass
+        """停止 VLC 播放（返回主页 / 上一步 / 跳过 都会走这里）。
+
+        ⚠️ 一、`set_hwnd(0)` 绝对不要调（2026-09-19 实测推翻旧铁律）
+          旧注释说"先 set_hwnd(0) 解绑再 stop()"，实测是错的：Windows 上 `set_hwnd(0)`
+          **并不会解绑**，VLC 把 0 当成 HWND 0（桌面），于是**销毁并重建整个 vout**
+          （D3D11 设备 + surface 池）。实测 stop() 耗时：调 set_hwnd(0) 1552ms vs 不调 486ms。
+
+        ⚠️ 二、`stop()` 绝不能在 GUI（主）线程调用（2026-09-19 11:12 抓栈实锤）
+          抓到的主线程栈：
+              _request_back → request_exit → _teardown_exam → _stop_video
+                → self.player.stop() → libvlc_media_player_stop   ← 卡死在这里
+          原因：VLC 的 vout 线程会用**同步 SendMessage** 给嵌入窗口（video_frame，属于
+          GUI 线程）发消息；而 GUI 线程正堵在 stop() 里等 vout 收尾 → 互相等待 = 死锁。
+          1080p 起播时 VLC 会连建 2~3 次 vout（每次新建 D3D11 设备 + surface 池），
+          vout 线程忙 → 这个窗口非常宽 → 「返回主页未响应」必现。
+          （之前实测 stop() 只要 33ms 是假象：那是在 vout 已经稳定时测的。）
+          → 所以 stop 放在后台线程；主线程只等 50ms，超时就放弃等待继续跑。
+        """
+        # 世代号：若这轮停止还没执行完就已经开始了新的播放，就放弃这次停止，
+        # 否则后台线程会把新播放给停掉。
+        self._vlc_gen = getattr(self, "_vlc_gen", 0) + 1
+        gen = self._vlc_gen
+        # 「飞行中的停止」计数：主线程只等 50ms，所以起播前要靠它判断
+        # "已经有一个停止在跑了，不用再叠加一次"（两个 stop 并发会互相踩）。
+        self._vlc_stop_pending = getattr(self, "_vlc_stop_pending", 0) + 1
+        done = threading.Event()
+
+        def _stop_work():
+            t0 = time.time()
+            try:
+                # 先静音，避免"点了返回还在响"（也让放弃等待时至少不出声）
+                try:
+                    self.player.audio_set_volume(0)
+                except Exception:
+                    pass
+                try:
+                    self.player.set_pause(1)
+                except Exception:
+                    pass
+                if gen != self._vlc_gen:
+                    return                     # 已有新播放接管，别动
+                self.player.stop()             # stop() 自己会销毁 vout / 视频子窗口
+                if gen != self._vlc_gen:
+                    return
+                try:
+                    self.player.set_media(None)   # 防旧媒体 EndReached 切页后误触发
+                except Exception:
+                    pass
+                try:
+                    self.player.audio_set_volume(100)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                # 只在这里打耗时：主线程已经不等它了，慢也只是后台慢，界面不受影响
+                spent = 1000 * (time.time() - t0)
+                if spent > 300:
+                    print(f"[VLC] ⚠️ 后台 stop 耗时 {spent:.0f}ms（主线程不等它）")
+                self._vlc_stop_pending -= 1
+                if self._vlc_stop_pending < 0:
+                    self._vlc_stop_pending = 0
+                done.set()
+
+        threading.Thread(target=_stop_work, daemon=True).start()
+        # 只等 50ms（约 3 帧），几乎不会被感知：
+        #   · 正常停止几十毫秒就完成，行为与同步版一致；
+        #   · 一旦 VLC 卡住（1080p + 核显，vout 收尾实测可达 400ms 以上）立刻放弃等待，GUI 继续跑。
+        # 这是修复「返回主页未响应」的关键：**主线程绝不能等到 libvlc 返回**。
+        done.wait(0.05)
+
+        # VLC 子窗口已销毁（或即将销毁），后续不要再拿旧 hwnd 去枚举
+        self._vlc_parent_hwnd = None
 
     def _show_text(self, text):
         self.text_display.setPlainText(text)
@@ -3628,7 +4876,8 @@ class PracticePage(QWidget):
         if self.mode == "exam":
             QMessageBox.information(self, "模考完成", "模考结束，即将进行离线批改。")
         else:
-            QMessageBox.information(self, "练习完成", "练习结束，即将进行离线批改。")
+            QMessageBox.information(self, self._mode_text() + "完成",
+                                   self._mode_text() + "结束，即将进行离线批改。")
         self.run_evaluation()
 
     def run_evaluation(self):
@@ -3642,16 +4891,38 @@ class PracticePage(QWidget):
         QMessageBox.information(self, "批改完成", "练习记录与参考批改已保存至历史记录。")
 
     def _perform_evaluation(self, vosk_model):
+        # 专项训练：只批改选定的篇目，其余篇目从评估结果与历史里剥离，避免误显示/误算总分
+        selection = None
+        if self.mode == "special":
+            sel = self.selected_parts
+            selection = {
+                'partA': 'A' in sel,
+                'partB_three': {i: ('B' in sel) for i in range(len(self.pkg.partB_three_questions))},
+                'partB_five': {i: ('B' in sel) for i in range(len(self.pkg.partB_five_answers))},
+                'partC': 'C' in sel,
+            }
         self.session.evaluation = evaluate_recordings({
             "partA": self.session.partA_recording,
             "partB": self.session.partB_slots,
             "partC": self.session.partC_recording,
-        }, self.pkg, vosk_model)
+        }, self.pkg, vosk_model, selection=selection)
+        if self.mode == "special":
+            # 剥离未训练篇目的占位结果，详情页/总分只反映本次训练的篇目
+            ev = self.session.evaluation
+            if 'A' not in self.selected_parts:
+                ev.pop('partA', None)
+            if 'B' not in self.selected_parts:
+                ev.pop('partB_three', None)
+                ev.pop('partB_five', None)
+            if 'C' not in self.selected_parts:
+                ev.pop('partC', None)
 
     def _save_history(self):
         os.makedirs(HISTORY_DIR, exist_ok=True)
         history = {
             "package": self.pkg.meta.get("name", ""),
+            "mode": self.mode,
+            "parts": sorted(self.selected_parts) if self.mode == "special" else ["A", "B", "C"],
             "timestamp": self.session.timestamp.isoformat(),
             "recordings": {
                 "partA": self.session.partA_recording,
@@ -3667,24 +4938,124 @@ class PracticePage(QWidget):
 
 # ------------------ 历史记录页面 ------------------
 class HistoryPage(QWidget):
+    # 分类徽标配色（与详情页 _d_chip 同一体系：浅底 + 细描边 + 深字）
+    _MODE_STYLES = {
+        "practice": ("练习",     "#F2F8FD", "#DCE9F3", "#283593"),
+        "exam":     ("模考",     "#FFF7E8", "#F0E3B8", "#8a6d1f"),
+        "special":  ("专项训练", "#F6F0FB", "#E6D3F0", "#7B1FA2"),
+    }
+
     def __init__(self, main_window):
         super().__init__()
         self.main = main_window
-        layout = QVBoxLayout()
-        self.list_widget = QListWidget()
-        self.list_widget.itemDoubleClicked.connect(self.view_detail)
-        self.btn_reeval = QPushButton("重新批改选中记录")
-        self.btn_reeval.clicked.connect(self.reevaluate_selected)
-        self.btn_delete = QPushButton("删除选中记录")
-        self.btn_delete.clicked.connect(self.delete_selected)
-        btn_back = QPushButton("返回主页")
-        btn_back.clicked.connect(lambda: self.main.go_to(self.main.home_page))
-        layout.addWidget(QLabel("练习历史记录（双击查看详情）"))
-        layout.addWidget(self.list_widget)
-        layout.addWidget(self.btn_reeval)
-        layout.addWidget(self.btn_delete)
-        layout.addWidget(btn_back)
-        self.setLayout(layout)
+        self.setObjectName("hsRoot")
+        self.setStyleSheet(
+            f"#hsRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f" stop:0 {D_BG_TOP}, stop:1 {D_BG_BOT}); }}")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 22, 28, 18)
+        root.setSpacing(12)
+
+        # ── 标题 ──
+        title = QLabel("练习历史记录")
+        _bind_font(title, 20, medium=True)
+        title.setStyleSheet(f"color:{D_TEXT}; background:transparent;")
+        sub = QLabel("双击查看详情 · 选中后可重新批改或删除")
+        _bind_font(sub, 12)
+        sub.setStyleSheet(f"color:{D_SUB}; background:transparent;")
+        root.addWidget(title)
+        root.addWidget(sub)
+
+        # ── 白卡 + 三列结构化列表（标题 | 分类 | 时间）──
+        card = QFrame()
+        card.setObjectName("hsCard")
+        card.setStyleSheet(
+            f"#hsCard {{ background:{D_CARD}; border:1px solid {D_BD};"
+            f" border-radius:14px; }}")
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(4, 2, 4, 4)
+        cv.setSpacing(0)
+
+        self.list_widget = QTreeWidget()
+        self.list_widget.setObjectName("hsTree")
+        self.list_widget.setColumnCount(3)
+        self.list_widget.setHeaderLabels(["标题", "分类", "时间"])
+        self.list_widget.setRootIsDecorated(False)
+        self.list_widget.setUniformRowHeights(True)
+        self.list_widget.setAllColumnsShowFocus(True)
+        self.list_widget.setIndentation(0)
+        self.list_widget.setFrameShape(QFrame.NoFrame)
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list_widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.list_widget.itemDoubleClicked.connect(
+            lambda it, _col: self.view_detail(it))
+        _bind_font(self.list_widget, 14)
+        _SmoothScroll(self.list_widget)   # 运行时新建的滚动区要手动挂缓动滚动
+
+        hh = self.list_widget.header()
+        hh.setSectionsMovable(False)
+        hh.setStretchLastSection(False)
+        # ❗列宽规则（2026-09-28 用户最终定稿）：
+        #  · 标题(0)=Stretch 占满左侧剩余宽度；分类(1)、时间(2)=Fixed 固定宽、固定位置、贴最右。
+        #  · 拖拽能力删除：分类/时间是 Fixed → 两根分隔线都拖不动（用户："拉动就删了"）。
+        #    标题是 Stretch 也没法拖 —— 它本就是自适应撑满。整体"列宽不可手动调"。
+        #  · 排序照旧保留（setSortingEnabled + sortByColumn）。
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.resizeSection(1, 132)
+        hh.resizeSection(2, 178)
+        hh.setMinimumSectionSize(56)
+        self.list_widget.headerItem().setTextAlignment(
+            2, Qt.AlignRight | Qt.AlignVCenter)
+
+        # ⚠️ QFrame 选择器会命中 QLabel，全部用 #objectName 限定
+        # ❗padding-right 必须留够（26px）：排序指示箭头由 style 画在 section 右端，
+        #   而 QSS 的 padding 决定文字位置，两者互不知情。padding-right 太小(8px)时，
+        #   右对齐的"时间"表头文字会正好压在箭头上 —— 用户截图里箭头糊在"间"字上。
+        #   留 26px 后文字右边缘 (~805) 与箭头 (~816) 之间隔开约 11px。
+        self.list_widget.setStyleSheet(f"""
+            #hsTree {{ background:transparent; border:none; outline:none; }}
+            #hsTree::item {{ height:44px; padding-left:8px; border:none; }}
+            #hsTree::item:hover {{ background:#F2F8FD; }}
+            #hsTree::item:selected {{ background:#E3F2FD; color:{D_TEXT}; }}
+            QHeaderView::section {{
+                background:transparent; border:none;
+                border-bottom:1px solid {D_LINE};
+                border-right:1px solid {D_DIV};
+                padding:6px 26px 6px 8px; font-size:12px; color:{D_SUB};
+            }}
+            QHeaderView::section:last {{ border-right:none; }}
+        """)
+        cv.addWidget(self.list_widget)
+        root.addWidget(card, 1)
+
+        # ── 底部操作（与详情页按钮同一套样式；删除用红色系提示危险）──
+        btns = QHBoxLayout()
+        btns.setSpacing(10)
+
+        def _btn(text, slot, danger=False):
+            b = QPushButton(text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(40)
+            _bind_font(b, 13)
+            fg, bd, hv = (("#c0392b", "#F0D5D5", "#FDECEC") if danger
+                          else (D_SUB, D_BD, D_LINE))
+            b.setStyleSheet(
+                f"QPushButton {{ background:{D_CARD}; border:1px solid {bd};"
+                f" border-radius:10px; padding:0 22px; color:{fg}; }}"
+                f"QPushButton:hover {{ background:{hv}; }}")
+            b.clicked.connect(slot)
+            return b
+
+        btns.addWidget(_btn("重新批改选中记录", self.reevaluate_selected))
+        btns.addWidget(_btn("删除选中记录", self.delete_selected, danger=True))
+        btns.addStretch(1)
+        btns.addWidget(_btn("返回主页",
+                            lambda: self.main.go_to(self.main.home_page)))
+        root.addLayout(btns)
 
     def showEvent(self, event):
         self.load_history()
@@ -3699,19 +5070,66 @@ class HistoryPage(QWidget):
             try:
                 with open(f, 'r', encoding='utf-8') as fh:
                     data = json.load(fh)
-                item_text = f"{data.get('package','?')}  {data.get('timestamp','')}"
-                item = QListWidgetItem(item_text)
-                item.setData(Qt.UserRole, str(f))
-                self.list_widget.addItem(item)
+                # 结构化三列：标题 | 分类 | 时间。
+                # 分类是带配色的徽标（练习/模考/专项训练·篇目）；旧记录无 mode 字段 → 按「练习」回退（与详情徽标一致）
+                mode = data.get('mode', '') or 'practice'
+                label, bg, bd, fg = self._MODE_STYLES.get(
+                    mode, self._MODE_STYLES["practice"])
+                if mode == "special":
+                    parts = data.get('parts') or []
+                    if parts:
+                        label += f"·{''.join(parts)}"
+                ts = str(data.get('timestamp', ''))
+                ts_clean = ts.split('.')[0].replace('T', ' ') if ts else ''
+
+                it = QTreeWidgetItem([str(data.get('package', '?')), label, ts_clean])
+                it.setData(0, Qt.UserRole, str(f))
+                it.setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
+                it.setForeground(2, QBrush(QColor(D_SUB)))
+                # ❗分类列的文字只为「点表头能按分类排序」而存在（排序用 DisplayRole 文本）。
+                #   必须设成全透明：否则 delegate 会把黑字画在 chip 底下，chip 盖不住的
+                #   左边缘 1~2px 就露出 ClearType 亚像素边缘 —— 用户看到的那个"小黑点"。
+                it.setForeground(1, QBrush(Qt.transparent))
+                self.list_widget.addTopLevelItem(it)
+
+                # 分类列放彩色徽标（setItemWidget 会铺满单元格，外面套一层留边）
+                wrap = QWidget()
+                wrap.setStyleSheet("background:transparent;")
+                wl = QHBoxLayout(wrap)
+                wl.setContentsMargins(4, 5, 4, 5)
+                chip = QLabel(label)
+                chip.setObjectName("hsChip")
+                chip.setAlignment(Qt.AlignCenter)
+                chip.setFixedHeight(26)
+                chip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                _bind_font(chip, 12)
+                chip.setStyleSheet(
+                    f"#hsChip{{background:{bg};border:1px solid {bd};"
+                    f"border-radius:9px;color:{fg};}}")
+                wl.addWidget(chip)
+                self.list_widget.setItemWidget(it, 1, wrap)
             except:
                 pass
+        if self.list_widget.topLevelItemCount() == 0:
+            empty = QTreeWidgetItem(["（暂无练习记录）", "", ""])
+            empty.setDisabled(True)
+            empty.setForeground(0, QBrush(QColor(D_MUTED)))
+            self.list_widget.addTopLevelItem(empty)
+            return
+
+        # 启用排序（点表头即排），默认按时间降序（最新在前）。
+        # 时间列文本为 "YYYY-MM-DD HH:MM:SS"，零填充，字典序==时间序。
+        self.list_widget.setSortingEnabled(True)
+        self.list_widget.sortByColumn(2, Qt.DescendingOrder)
+        # 列宽规则：标题=Stretch 占满左侧，分类/时间=Fixed 固定贴右（不参与排序箭头布局）。
+        # 排序照旧保留：点表头即排，默认按时间降序。
 
     def delete_selected(self):
         current_item = self.list_widget.currentItem()
         if not current_item:
             QMessageBox.information(self, "提示", "请先选择一条记录")
             return
-        path = current_item.data(Qt.UserRole)
+        path = current_item.data(0, Qt.UserRole)
         if not path or not os.path.exists(path):
             return
         reply = QMessageBox.question(self, "确认删除", "确定要删除该历史记录吗？",
@@ -3728,7 +5146,7 @@ class HistoryPage(QWidget):
         if not current_item:
             QMessageBox.information(self, "提示", "请先选择一条记录")
             return
-        path = current_item.data(Qt.UserRole)
+        path = current_item.data(0, Qt.UserRole)
         if not path or not os.path.exists(path):
             return
         try:
@@ -3884,8 +5302,455 @@ class HistoryPage(QWidget):
         QMessageBox.information(self, "完成", f"已重新批改 {cnt} 个题目")
         self.load_history()
 
+    # ═══════════════════════ 练习详情（Fluent 卡片版）═══════════════════════
     def view_detail(self, item):
-        path = item.data(Qt.UserRole)
+        """打开「练习详情」。优先用真控件渲染（有真圆角卡片），异常时回退旧 HTML 版。"""
+        path = item.data(0, Qt.UserRole)
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[DETAIL] 读取记录失败: {e}")
+            return
+        try:
+            body = self._detail_body(data)
+        except Exception as e:                      # 兜底：别让详情页打不开
+            print(f"[DETAIL] ⚠️ 控件版详情渲染失败，回退 HTML 版: {e}")
+            import traceback as _tb
+            _tb.print_exc()
+            self._detail_html_legacy(item)
+            return
+        self._detail_dialog(body)
+
+    def _detail_body(self, data):
+        """把一条记录拼成整页内容（若干张 Fluent 卡片）。"""
+        holder = QWidget()
+        holder.setObjectName("dBody")
+        holder.setStyleSheet("#dBody{background:transparent;}")
+        v = QVBoxLayout(holder)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(14)
+
+        v.addWidget(self._detail_head_card(data))
+        for card in (self._detail_recordings_card(data),
+                     self._detail_eval_card(data),
+                     self._detail_pkg_card(data)):
+            if card is not None:
+                v.addWidget(card)
+
+        note = _d_label("⚠ 批改结果基于离线语音识别，仅供参考。", 11, D_MUTED)
+        note.setAlignment(Qt.AlignCenter)
+        v.addWidget(note)
+        return holder
+
+    def _detail_head_card(self, data):
+        """顶部：题目包名 + 考试时间。"""
+        pkg_name = str(data.get('package', '') or '—')
+        ts = str(data.get('timestamp', '') or '')
+        ts_clean = ts.split('.')[0].replace('T', ' ') if ts else ''
+
+        f = QFrame()
+        f.setObjectName("dHead")
+        f.setStyleSheet(
+            "#dHead{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #EAF6FE,stop:1 #F6FBFF);"
+            "border:1px solid #D8EAF7;border-radius:14px;}")
+        v = QVBoxLayout(f)
+        v.setContentsMargins(18, 13, 18, 14)
+        v.setSpacing(3)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        ic = QLabel()
+        ic.setFixedSize(18, 18)
+        ic.setStyleSheet("background:transparent;")
+        ic.setPixmap(_svg_pixmap(D_ICON_PKG, D_ACCENT_DEEP, 18))
+        top.addWidget(ic)
+        top.addWidget(_d_label("题目包", 12, D_SUB, wrap=False))
+        top.addStretch(1)
+        # 模式 + 篇目标签（与历史列表一致：模考/练习/专项 区分；专项额外标篇目）
+        # 练习/模考记录同样显示徽标；旧记录没有 mode 字段 → 按「练习」回退（早期版本不记录模式）
+        mode = data.get('mode', '') or 'practice'
+        mode_text = {"practice": "练习", "exam": "模考", "special": "专项训练"}.get(mode, mode)
+        if mode == "special" and data.get('parts'):
+            mode_text += "（" + "、".join("Part " + p for p in data['parts']) + "）"
+        top.addWidget(_d_chip(mode_text, fit=True))
+        if ts_clean:
+            top.addWidget(_d_label(ts_clean, 12, D_SUB, wrap=False))
+        v.addLayout(top)
+        v.addWidget(_d_label(pkg_name, 15, D_TEXT, medium=True, wrap=True))
+        return f
+
+    def _detail_recordings_card(self, data):
+        """录音文件卡片：左列 = Part A + 三问 + Part C，右列 = 五答。"""
+        rec = data.get('recordings', {}) or {}
+        left, right = [], []
+
+        pa = rec.get('partA', '')
+        if pa:
+            left.append(('Part A', os.path.basename(pa)))
+
+        pb = rec.get('partB', {})
+        if isinstance(pb, dict):
+            for k in ('PartB_Q1', 'PartB_Q2', 'PartB_Q3'):
+                val = pb.get(k)
+                if val:
+                    left.append((k.replace('PartB_', ''), os.path.basename(val)))
+            for k in ('PartB_A1', 'PartB_A2', 'PartB_A3', 'PartB_A4', 'PartB_A5'):
+                val = pb.get(k)
+                if val:
+                    right.append((k.replace('PartB_', ''), os.path.basename(val)))
+        elif isinstance(pb, list):
+            # 旧格式 list：前 3 个是三问，后 5 个是五答
+            for i, r in enumerate(pb):
+                it = (f'B{i + 1}', os.path.basename(r) if r else '')
+                (left if i < 3 else right).append(it)
+
+        pc = rec.get('partC', '')
+        if pc:
+            left.append(('Part C', os.path.basename(pc)))
+
+        if not (left or right):
+            return None
+
+        card, cv = _d_card('录音文件', D_ICON_MIC)
+        cols = QHBoxLayout()
+        cols.setSpacing(14)
+        for items in (left, right):
+            col = QVBoxLayout()
+            col.setSpacing(6)
+            for lab, fname in items:
+                col.addWidget(_d_chip(f'{lab}: {fname or "(无)"}'))
+            col.addStretch(1)
+            box = QWidget()
+            box.setStyleSheet("background:transparent;")
+            box.setLayout(col)
+            cols.addWidget(box, 1)
+        cv.addLayout(cols)
+        return card
+
+    def _detail_eval_card(self, data):
+        """批改结果卡片：总分横幅 + 左栏(A/B/C 得分) + 右栏(三问/五答逐题)。"""
+        ev = data.get('evaluation', {}) or {}
+        if not ev:
+            return None
+
+        PART_A_MAX, PART_B_PER_ITEM, PART_C_MAX = 20, 2, 24
+
+        acc_val = wer_val = acc_score = None
+        acc_color = D_SUB
+        if 'partA' in ev:
+            a = ev['partA']
+            acc_val = a.get('accuracy', 0) * 100
+            acc_score = a.get('accuracy', 0) * PART_A_MAX
+            wer_val = a.get('wer', 0)
+            acc_color = ('#c0392b' if acc_val < 60 else
+                         '#e67e22' if acc_val < 80 else '#27ae60')
+
+        def _mk_rows(key, prefix):
+            out = []
+            for i, t in enumerate(ev.get(key, []) or []):
+                sim = t.get('similarity', 0) if isinstance(t, dict) else 0
+                c = ('#c0392b' if sim < 0.6 else
+                     '#e67e22' if sim < 0.8 else '#27ae60')
+                out.append((f'{prefix}{i + 1}', sim, sim * PART_B_PER_ITEM, c))
+            return out
+
+        rows_three = _mk_rows('partB_three', '三问')
+        rows_five = _mk_rows('partB_five', '五答')
+        partB_max = (len(rows_three) + len(rows_five)) * PART_B_PER_ITEM
+        partB_score = (sum(p for _, _, p, _ in rows_three)
+                       + sum(p for _, _, p, _ in rows_five))
+
+        has_partC = 'partC' in ev
+        partC_score = partC_sim_pct = None
+        partC_color = D_SUB
+        if has_partC:
+            sem_sim = ev['partC'].get('semantic_sim')
+            if sem_sim is not None:
+                try:                       # 旧记录可能存成字符串
+                    sem_sim = float(sem_sim)
+                except (TypeError, ValueError):
+                    sem_sim = None
+            if sem_sim is not None:
+                partC_sim_pct = sem_sim * 100
+                partC_score = sem_sim * PART_C_MAX
+                partC_color = ('#4caf50' if sem_sim >= 0.8 else
+                               '#ff9800' if sem_sim >= 0.6 else '#f44336')
+
+        # 总分分母按实际训练篇目动态计算：专项训练只算选定篇目，避免 x.x/60 误导
+        TOTAL_MAX = ((PART_A_MAX if acc_score is not None else 0)
+                     + partB_max
+                     + (PART_C_MAX if has_partC else 0))
+        total_score = (acc_score or 0) + partB_score + (partC_score or 0)
+        total_ratio = total_score / TOTAL_MAX if TOTAL_MAX else 0
+        total_color = ('#c0392b' if total_ratio < 0.6 else
+                       '#e67e22' if total_ratio < 0.8 else '#27ae60')
+
+        card, cv = _d_card('批改结果', D_ICON_CHART)
+
+        # ── 总分横幅 ──
+        banner, bv = _d_panel('#F7FBFF', D_BD, radius=10,
+                              margins=(16, 12, 16, 12), spacing=0)
+        total_txt = (f'<span style="color:{D_SUB};font-size:15px">总分：</span>'
+                     f'<b style="font-size:24px;color:{total_color}">{total_score:.1f}</b>'
+                     f'<span style="color:{D_MUTED};font-size:14px">/{TOTAL_MAX}</span>')
+        lb_total = QLabel(total_txt)
+        lb_total.setTextFormat(Qt.RichText)
+        lb_total.setAlignment(Qt.AlignCenter)
+        lb_total.setStyleSheet("background:transparent;")
+        _bind_font(lb_total, 15)
+        bv.addWidget(lb_total)
+        cv.addWidget(banner)
+
+        # ── 左右双栏 ──
+        cols = QHBoxLayout()
+        cols.setSpacing(14)
+
+        # 左栏：Part A / Part B 总分 / Part C
+        lcol = QVBoxLayout()
+        lcol.setSpacing(9)
+        if acc_score is not None:
+            lcol.addWidget(_d_part_block(
+                'Part A 得分', acc_score, PART_A_MAX, acc_color,
+                f'准确率 {acc_val:.1f}%　WER: {wer_val:.2f}',
+                '#E3F2FD', '#C7E2F8', '#1565C0'))
+        if rows_three or rows_five:
+            lcol.addWidget(_d_part_block(
+                'Part B 总分', partB_score, partB_max, '#c06262',
+                f'{len(rows_three)} 问 + {len(rows_five)} 答，每题 {PART_B_PER_ITEM} 分',
+                '#F7DCDC', '#E8C4C4', '#a04a4a'))
+        if has_partC and partC_score is not None:
+            lcol.addWidget(_d_part_block(
+                'Part C 得分', partC_score, PART_C_MAX, partC_color,
+                f'匹配度 {partC_sim_pct:.1f}%　要点覆盖: '
+                f'{ev["partC"].get("coverage", "")}',
+                '#FFFDE7', '#EADFB0', '#8a6d1f'))
+        lcol.addStretch(1)
+        lbox = QWidget()
+        lbox.setStyleSheet("background:transparent;")
+        lbox.setLayout(lcol)
+        cols.addWidget(lbox, 1)
+
+        # 右栏：三问组 / 五答组
+        rcol = QVBoxLayout()
+        rcol.setSpacing(9)
+        for rows, bg, bd, bar in ((rows_three, '#FAF3FD', '#E6D3F0', '#9C27B0'),
+                                  (rows_five, '#F1F9F2', '#CDE8D2', '#4CAF50')):
+            if not rows:
+                continue
+            grp, gv = _d_panel(bg, bd, radius=10, margins=(8, 8, 8, 8), spacing=4)
+            for lab, sim, pts, c in rows:
+                gv.addWidget(_d_score_row(lab, sim, pts, c,
+                                          PART_B_PER_ITEM, bar))
+            rcol.addWidget(grp)
+        rcol.addStretch(1)
+        rbox = QWidget()
+        rbox.setStyleSheet("background:transparent;")
+        rbox.setLayout(rcol)
+        cols.addWidget(rbox, 1)
+
+        cv.addLayout(cols)
+        return card
+
+    def _detail_pkg_card(self, data):
+        """题目内容卡片：Part A 原文 / Part B 情景对话 / Part C 故事复述。
+
+        专项训练记录：只渲染本次选定的篇目 —— 未选篇目即便题目包里还有内容
+        （`to_dict()` 会输出空的 partB/partC 子字典，`if pb:` 判真就会画出空卡片），
+        一律不显示。非专项记录（练习/模考）不受影响，照旧全显示。
+        """
+        pkg = data.get('package_data', {}) or {}
+        if not pkg:
+            return None
+        card, cv = _d_card('题目内容', D_ICON_DOC)
+
+        # 专项训练：按记录的 parts 过滤；练习/模考 = None（不过滤）
+        _sel = (set(data.get('parts') or []) if data.get('mode') == 'special' else None)
+
+        def _on(letter):
+            return _sel is None or letter in _sel
+
+        # ── Part A 原文 ──
+        pa = pkg.get('partA', {}) or {}
+        if pa and _on('A'):
+            body, bv = _d_panel('#F4F9FE', '#D8E8F6', margins=(14, 12, 14, 13))
+            bv.addWidget(_d_label(str(pa.get('hidden_text', '无')),
+                                  13, '#22333F', wrap=True, selectable=True))
+            cv.addWidget(_d_section('Part A 原文', '#1565C0', body))
+
+        # ── Part B 情景对话 ──
+        pb = pkg.get('partB', {}) or {}
+        if pb and _on('B'):
+            wrap = QWidget()
+            wrap.setStyleSheet("background:transparent;")
+            wv = QVBoxLayout(wrap)
+            wv.setContentsMargins(0, 0, 0, 0)
+            wv.setSpacing(10)
+
+            sit, sv = _d_panel('#FFF9E8', '#F0E3B8', margins=(13, 10, 13, 11))
+            sv.addWidget(_d_label(str(pb.get('situation', '无')),
+                                  13, '#4A3C12', wrap=True, selectable=True))
+            wv.addWidget(_d_section('情景', '#B8860B', sit))
+
+            lt = pb.get('listening_text', '')
+            if lt:
+                ltp, lv = _d_panel('#F1F7FC', '#D5E5F2', margins=(13, 10, 13, 11))
+                lv.addWidget(_d_label(str(lt), 13, '#22333F',
+                                      wrap=True, selectable=True))
+                wv.addWidget(_d_section('听原文', '#1565C0', ltp))
+
+            three_q = pb.get('three_questions', []) or []
+            if three_q:
+                p, pv = _d_panel('#FAF3FD', '#E6D3F0', margins=(10, 9, 10, 10), spacing=4)
+                for i, q in enumerate(three_q):
+                    pv.addWidget(self._detail_qa_row(
+                        f'Q{i + 1}', q.get('cn_prompt', ''), q.get('hidden_answer', ''),
+                        '#9C27B0'))
+                wv.addWidget(_d_section('三问', '#8E44AD', p))
+
+            five_a = pb.get('five_answers', []) or []
+            if five_a:
+                p, pv = _d_panel('#F1F9F2', '#CDE8D2', margins=(10, 9, 10, 10), spacing=4)
+                for i, a in enumerate(five_a):
+                    pv.addWidget(self._detail_qa_row(
+                        f'A{i + 1}', a.get('en_question', ''), a.get('hidden_answer', ''),
+                        '#4CAF50'))
+                wv.addWidget(_d_section('五答', '#16A085', p))
+
+            cv.addWidget(_d_section('Part B 情景对话', '#B26A00', wrap))
+
+        # ── Part C 故事复述 ──
+        pc = pkg.get('partC', {}) or {}
+        if pc and _on('C'):
+            body, bv = _d_panel('#FBFCFD', '#E5EBF1',
+                                margins=(14, 12, 14, 13), spacing=8)
+            rows = [('梗概', pc.get('summary', '无'), '#F7F9FB'),
+                    ('关键词', pc.get('keywords', '无'), '#F7F9FB')]
+            story = pc.get('tts_text', '')
+            if story:
+                rows.append(('故事全文', story, '#F7F9FB'))
+            kp = pc.get('key_points', '')
+            if kp:
+                rows.append(('答案要点', kp, '#FFFDE7'))
+            for lab, val, bg in rows:
+                r = QHBoxLayout()
+                r.setSpacing(10)
+                lb_lab = _d_label(lab, 12, D_SUB, wrap=False)
+                lb_lab.setFixedWidth(62)
+                lb_lab.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+                r.addWidget(lb_lab)
+                vp, vv = _d_panel(bg, '#E9EEF3', radius=8,
+                                  margins=(11, 8, 11, 9), spacing=0)
+                vv.addWidget(_d_label(str(val), 13, '#22333F',
+                                      wrap=True, selectable=True))
+                r.addWidget(vp, 1)
+                bv.addLayout(r)
+            cv.addWidget(_d_section('Part C 故事复述', '#C0392B', body))
+
+        # 三个 Part 一个都没有 → 这张卡没必要出现
+        if cv.count() <= 2:          # 2 = 标题行 + 分割线
+            card.deleteLater()
+            return None
+        return card
+
+    def _detail_qa_row(self, tag, prompt, answer, color):
+        """题目内容里的「Q1 中文提示 → 隐藏答案」一行。"""
+        f = QFrame()
+        f.setObjectName("dQA")
+        f.setStyleSheet(f"#dQA{{background:#FFFFFF;border:none;"
+                        f"border-left:4px solid {color};border-radius:6px;}}")
+        h = QHBoxLayout(f)
+        h.setContentsMargins(12, 8, 12, 8)
+        h.setSpacing(12)
+
+        head = QLabel(f"<b style='color:{color}'>{tag}</b>")
+        head.setTextFormat(Qt.RichText)
+        _bind_font(head, 12)
+        head.setStyleSheet("background:transparent;")
+        head.setFixedWidth(88)
+        head.setWordWrap(True)
+        head.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        h.addWidget(head)
+
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        if prompt:
+            col.addWidget(_d_label(str(prompt), 12, D_SUB, wrap=True, selectable=True))
+        col.addWidget(_d_label(str(answer), 13, '#22333F',
+                               wrap=True, selectable=True))
+        h.addLayout(col, 1)
+        return f
+
+    def _detail_dialog(self, body):
+        """详情对话框外壳：渐变底 + 缓动滚动 + Fluent 滚动条 + 主色关闭按钮。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("练习详情")
+        dialog.setWindowFlags(dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dialog.resize(920, 740)
+        dialog.setMinimumSize(640, 470)
+
+        root = QWidget(dialog)
+        root.setObjectName("dtRoot")
+        root.setStyleSheet(
+            f"#dtRoot{{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f"stop:0 {D_BG_TOP},stop:1 {D_BG_BOT});}}")
+        rv = QVBoxLayout(root)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
+
+        area = QScrollArea(root)
+        area.setObjectName("dtScroll")
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setStyleSheet("#dtScroll{background:transparent;border:none;}")
+        area.viewport().setStyleSheet("background:transparent;")   # 视口才是真正露底的地方
+
+        holder = QWidget()
+        holder.setObjectName("dtHolder")
+        holder.setStyleSheet("#dtHolder{background:transparent;}")
+        hv = QVBoxLayout(holder)
+        hv.setContentsMargins(16, 15, 16, 16)      # 底部留够，滚到最后一行不会被按钮压住
+        hv.setSpacing(14)
+        hv.addWidget(body)
+        hv.addStretch(1)
+        area.setWidget(holder)
+        _SmoothScroll(area)          # 对话框是运行时新建的，要手动挂缓动滚动
+        rv.addWidget(area, 1)
+
+        # 底部工具条：白底 + 顶部一根细线。用 QFrame 而不是 QWidget ——
+        # ⚠️ QWidget 的 QSS 只认 background/background-clip，**border 不生效**。
+        foot = QFrame()
+        foot.setObjectName("dtFoot")
+        foot.setStyleSheet(
+            f"#dtFoot{{background:{D_CARD};border:none;"
+            f"border-top:1px solid {D_LINE};}}")
+        fv = QVBoxLayout(foot)
+        fv.setContentsMargins(16, 12, 16, 14)      # 上 12 / 下 14：按钮不再贴着内容
+        btn_close = QPushButton("关闭")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.setFixedHeight(38)
+        btn_close.setMinimumWidth(132)
+        _bind_font(btn_close, 14, medium=True)
+        btn_close.setStyleSheet(
+            f"QPushButton{{background:{D_ACCENT_DEEP};color:#fff;border:none;"
+            f"border-radius:10px;padding:0 26px;}}"
+            f"QPushButton:hover{{background:#0A8AD0;}}"
+            f"QPushButton:pressed{{background:#0979B8;}}")
+        btn_close.clicked.connect(dialog.close)
+        fv.addWidget(btn_close, alignment=Qt.AlignCenter)
+        rv.addWidget(foot)
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(root)
+        dialog.exec_()
+
+    # ── 旧版 HTML 渲染（QTextBrowser 不支持圆角，仅作异常兜底保留）──
+    def _detail_html_legacy(self, item):
+        path = item.data(0, Qt.UserRole)
         if not path or not os.path.exists(path):
             return
         with open(path, 'r', encoding='utf-8') as f:
@@ -4313,7 +6178,7 @@ def load_vosk_model():
     return Model(MODEL_PATH)
 
 # ===== 更新检查（仅提示，不自动下载/替换）=====
-APP_VERSION = "2.1"   # 当前版本号；发布新版本时只改这一处
+APP_VERSION = "2.2"   # 当前版本号；发布新版本时只改这一处
 # version.json 放在 GitHub 仓库根目录。更新源顺序：
 #   1) GitHub API：读实时文件、无 CDN 缓存，改完立即生效（优先）；
 #   2) jsDelivr：国内直连快，但有缓存，作兜底；
@@ -4418,12 +6283,60 @@ if __name__ == "__main__":
     if _app_icon:
         app.setWindowIcon(QIcon(_app_icon))
     app.setStyle("Fusion")
+    # ⚠️ Fusion 默认会解析成 SimSun（宋体），必须显式换成 DEFAULT_FONT_CHOICE（微软雅黑 UI）；
+    #    字体缺失时 _ui_font() 会自动回退 _FONT_FALLBACK
+    _load_app_fonts()
+    # 用户上次在「更多 → 个性化」里选的字体
+    try:
+        _saved_font = _load_settings().get(SETTINGS_FONT_KEY)
+    except Exception:
+        _saved_font = None
+    if _saved_font:
+        _UI_FONT["choice"] = _saved_font
+        print(f"[FONT] 按用户偏好使用界面字体: {_saved_font}")
+    else:
+        _UI_FONT["choice"] = DEFAULT_FONT_CHOICE
+        print(f"[FONT] 未设置过界面字体，使用默认: {DEFAULT_FONT_CHOICE}")
+    app.setFont(_ui_font(12))
     app.setStyleSheet("""
         QMainWindow { background: #f5f6fa; }
         QLabel { color: #2c3e50; }
         QPushButton { font-size:16px; padding:10px 20px; border-radius:6px; background:#ecf0f1; border:1px solid #bdc3c7; }
         QPushButton:hover { background:#dcdde1; }
         QTextEdit, QLineEdit { border:1px solid #bdc3c7; border-radius:4px; padding:6px; }
+
+        /* ---------- 滚动条：Fluent 风格（细、圆角、无箭头、透明底） ---------- */
+        QScrollBar:vertical {
+            background: transparent; width: 12px; margin: 2px 2px 2px 0; border: none;
+        }
+        QScrollBar::handle:vertical {
+            background: #c9d4e0; min-height: 40px; border-radius: 4px; margin: 0 3px;
+        }
+        QScrollBar::handle:vertical:hover   { background: #a9bacb; }
+        QScrollBar::handle:vertical:pressed { background: #93a7bb; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px; background: transparent; border: none;
+        }
+        QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical { height: 0px; width: 0px; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+
+        QScrollBar:horizontal {
+            background: transparent; height: 12px; margin: 0 2px 2px 2px; border: none;
+        }
+        QScrollBar::handle:horizontal {
+            background: #c9d4e0; min-width: 40px; border-radius: 4px; margin: 3px 0;
+        }
+        QScrollBar::handle:horizontal:hover   { background: #a9bacb; }
+        QScrollBar::handle:horizontal:pressed { background: #93a7bb; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+            width: 0px; background: transparent; border: none;
+        }
+        QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal { height: 0px; width: 0px; }
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+
+        QScrollArea { border: none; background: transparent; }
     """)
     window = MainWindow()
+    # 所有页面都建好之后再统一挂缓动滚动（QScrollArea 在构造期就存在，这里是唯一时机）
+    _install_smooth_scroll()
     sys.exit(app.exec_())
