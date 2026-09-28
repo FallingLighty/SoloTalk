@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "2.1",
-    "notes": "2.1：① 新增「更多」板块——关于 / 更新&下载地址 / 意见反馈 / 使用须知&声明；② 支持「检查更新」，并可勾选「启动软件时自动检查更新」。",
-    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.1-desktop/SoloTalk_v2.1.7z"
+    "version": "2.2",
+    "notes": "2.2：请解压使用① 练习历史记录页改为三列结构化视图（标题｜分类｜时间），默认按时间倒序、点表头可排序；② 新增专项模式！！！！！可单独练ABC；③ 练习详情改用卡片式排版，更清爽；",
+    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.2-desktop/SoloTalk_v2.2.7z"
   },
   "mobile": {
     "version": "2.0",
