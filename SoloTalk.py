@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-SoloTalk 2.2 — 单机版听说模考编辑器
+SoloTalk 2.3 — 单机版听说模考编辑器
 依赖安装：pip install PyQt5 pyttsx3 sounddevice vosk python-vlc numpy fastembed edge-tts
 （edge-tts 为高质量神经语音，需联网；未安装或断网时自动回退系统 SAPI5 语音）
 所有控制台输出（print / 异常栈 / 崩溃栈）都会同步写入 _solo_diag.log（打包后写用户主目录），方便无控制台环境排查。
@@ -23,6 +23,8 @@ hf download Xenova/bge-small-en-v1.5 --local-dir "脚本同级目录/bge-small-e
 import sys
 import os
 import json
+import re
+import hashlib
 import weakref
 import zipfile
 import tempfile
@@ -716,6 +718,8 @@ class WindowsKeyBlocker:
 MODEL_PATH = _resolve_model_dir("vosk-model-small-en-us-0.15")
 RECORDINGS_DIR = "recordings"
 HISTORY_DIR = "history"
+# 创意工坊「题库」下载的题目包落盘目录（与 recordings/、history/ 同级，位于程序运行目录）
+WORKSHOP_DIR = "题库下载"
 SAMPLE_RATE = 16000
 TTS_TIMEOUT = 30
 
@@ -1077,12 +1081,35 @@ def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
 
     return eval_result
 
+# ------------------ 题目包读写（.solo 与 .zip 本质都是 zip） ------------------
+def _open_package_zip(path):
+    """读取题目包（data.json + 媒体文件），返回 (data, temp_dir, base_dir)。
+
+    `.solo` 与 `.zip` 都是普通 zip 包，唯一硬性要求是里面含 `data.json`。
+    兼容两种打包方式：① data.json 在压缩包根目录（本程序导出的标准包）；
+    ② 整包被套进一层文件夹（用户用系统「压缩到 zip」压文件夹时很常见）。
+    """
+    temp_dir = tempfile.mkdtemp(prefix="solotalk_")
+    with zipfile.ZipFile(path, 'r') as zf:
+        cands = [n for n in zf.namelist()
+                 if n == 'data.json' or n.endswith('/data.json')]
+        if not cands:
+            raise ValueError("压缩包里找不到 data.json，不是有效的题目包")
+        target = min(cands, key=lambda n: n.count('/'))   # 取层级最浅的那个
+        with zf.open(target) as f:
+            data = json.load(f)
+        zf.extractall(temp_dir)
+    sub = os.path.dirname(target)
+    base_dir = os.path.join(temp_dir, sub) if sub else temp_dir
+    return data, temp_dir, base_dir
+
+
 # ------------------ 数据模型 ------------------
 class SoloPackage:
     def __init__(self):
         self.meta = {
             "name": "Untitled",
-            "version": "2.2",
+            "version": "2.3",
             "created": datetime.datetime.now().isoformat(),
             "author": "",
             "anonymous": False
@@ -1214,12 +1241,14 @@ class MainWindow(QMainWindow):
         self.editor_page = EditorPage(self)
         self.practice_page = PracticePage(self)
         self.history_page = HistoryPage(self)
+        self.bank_page = QuestionBankPage(self)
         self.more_page = MorePage(self)
 
         self.central.addWidget(self.home_page)
         self.central.addWidget(self.editor_page)
         self.central.addWidget(self.practice_page)
         self.central.addWidget(self.history_page)
+        self.central.addWidget(self.bank_page)
         self.central.addWidget(self.more_page)
         self.central.setCurrentWidget(self.home_page)
 
@@ -1405,6 +1434,11 @@ D_ICON_MIC = [
     "M8 23h8",
 ]
 D_ICON_CHART = ["M18 20V10", "M12 20V4", "M6 20v-6"]
+D_ICON_WARN = [   # 警示三角（Feather alert-triangle）：Fluent 弹窗用
+    "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z",
+    "M12 9v4",
+    "M12 17h.01",
+]
 D_ICON_DOC = [
     "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z",
     "M14 2v6h6",
@@ -1657,6 +1691,105 @@ class FluentSelect(QPushButton):
         self._menu.exec_(pos)
 
 
+# ══════════════════ Fluent 风格提示 / 确认框 ══════════════════
+# ❗为什么不用 QMessageBox：它的按钮交给**系统主题**绘制 —— 灰底、方角、老式描边，
+#   和 App「天蓝渐变底 + 白色大圆角卡片 + 强调色按钮」完全不是一套语言
+#   （用户截图里那"三个灰按钮"就是它）。这里用真控件自己拼，与首页同源。
+class FluentMessageDialog(QDialog):
+    """与首页同源的 Fluent 提示/确认框：渐变底 + 单色线性图标 + 强调色圆角按钮。
+
+    用法：
+        dlg = FluentMessageDialog(
+            parent, "建议重新下载", "正文…", informative="次要说明…",
+            icon=D_ICON_WARN,
+            buttons=(("重新下载", "primary", "re"),
+                     ("无视风险，开始练习", "secondary", "ignore")))
+        dlg.exec_()
+        if dlg.clicked_key == "ignore":
+            ...
+
+    `buttons` 每项 = (按钮文字, 样式 kind, 回传 key)；kind ∈ primary / secondary / danger。
+    `clicked_key` 为 None 表示用户直接关窗（未点任何按钮）。
+    """
+
+    def __init__(self, parent, title, message, informative="", icon=None,
+                 buttons=(("确定", "primary", "ok"),), default_key="ok",
+                 min_width=440):
+        super().__init__(parent)
+        self.clicked_key = None
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setMinimumWidth(min_width)
+        self.setObjectName("fmRoot")
+        self.setStyleSheet(
+            f"#fmRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f" stop:0 {D_BG_TOP}, stop:1 {D_BG_BOT}); }}")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 18)
+        root.setSpacing(0)
+
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        if icon:
+            ic = QLabel()
+            ic.setFixedSize(36, 36)
+            ic.setAlignment(Qt.AlignCenter)
+            ic.setPixmap(_svg_pixmap(icon, "#E6A23C", 30))   # 琥珀色警示
+            ic.setStyleSheet("background:transparent;")
+            top.addWidget(ic, 0, Qt.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(7)
+        col.addWidget(_d_label(title, 16, D_TEXT, medium=True, wrap=True))
+        col.addWidget(_d_label(message, 13, D_SUB, wrap=True))
+        if informative:
+            col.addWidget(_d_label(informative, 12, D_MUTED, wrap=True))
+        top.addLayout(col, 1)
+        root.addLayout(top)
+        root.addSpacing(20)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        foot.addStretch(1)
+        self._btns = {}
+        for text, kind, key in buttons:
+            b = QPushButton(text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(38)
+            b.setMinimumWidth(104)
+            _bind_font(b, 13, medium=(kind == "primary"))
+            b.setStyleSheet(self._btn_qss(kind))
+            b.clicked.connect(lambda _=False, k=key: self._choose(k))
+            foot.addWidget(b)
+            self._btns[key] = b
+        root.addLayout(foot)
+        b0 = self._btns.get(default_key)
+        if b0 is not None:
+            b0.setDefault(True)
+            b0.setFocus()
+
+    @staticmethod
+    def _btn_qss(kind):
+        """按钮样式与首页/题库页同源：主按钮=强调色实心，次按钮=白底描边，危险=红字。"""
+        if kind == "primary":
+            return (f"QPushButton {{ background:{D_ACCENT_DEEP}; border:none;"
+                    f" border-radius:10px; padding:0 22px; color:#FFFFFF;"
+                    f" font-weight:bold; }}"
+                    f"QPushButton:hover {{ background:{D_ACCENT}; }}")
+        if kind == "danger":
+            return (f"QPushButton {{ background:#FFFFFF; border:1px solid #F0D5D5;"
+                    f" border-radius:10px; padding:0 22px; color:#C0392B; }}"
+                    f"QPushButton:hover {{ background:#FDECEC; }}")
+        return (f"QPushButton {{ background:#FFFFFF; border:1px solid {D_BD};"
+                f" border-radius:10px; padding:0 22px; color:{D_SUB}; }}"
+                f"QPushButton:hover {{ background:{D_LINE}; }}")
+
+    def _choose(self, key):
+        self.clicked_key = key
+        self.accept()
+
+
 # ══════════════════ 专项训练 · 篇目选择对话框 ══════════════════
 # 与首页/详情卡片同套 Fluent 配色：天蓝主色 + 大圆角白卡 + 单色线性图标。
 # 三张可选卡片 = Part A 模仿朗读 / Part B 角色扮演 / Part C 故事复述，
@@ -1897,6 +2030,7 @@ class HomePage(QWidget):
     ICON_HISTORY  = ["M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17z", "M12 7.5V12l3.2 2"]
     ICON_SPECIAL  = ["M12 3v3", "M12 18v3", "M3 12h3", "M18 12h3",
                      "M12 12m-5.5 0a5.5 5.5 0 1 0 11 0a5.5 5.5 0 1 0-11 0"]  # 准星/靶心：专项训练
+    ICON_BANK     = ["M4 5h7v6H4z", "M13 5h7v6h-7z", "M4 13h7v6H4z", "M13 13h7v6h-7z"]  # 2×2 网格：题库/应用库
 
     def __init__(self, main_window):
         super().__init__()
@@ -1933,7 +2067,7 @@ class HomePage(QWidget):
         tile_practice.clicked.connect(lambda: self.load_and_start("practice"))
         tile_exam = self._tile(self.ICON_EXAM, "模考模式", "不可跳过 / 上一步，试音不能跳过")
         tile_exam.clicked.connect(lambda: self.load_and_start("exam"))
-        tile_editor = self._tile(self.ICON_EDITOR, "编辑模式", "制作与导入 .solo 题目包")
+        tile_editor = self._tile(self.ICON_EDITOR, "编辑模式", "制作与导入题目包（.solo / .zip）")
         tile_editor.clicked.connect(lambda: self.main.go_to(self.main.editor_page))
         tile_history = self._tile(self.ICON_HISTORY, "历史记录", "查看往次成绩与录音回放")
         tile_history.clicked.connect(lambda: self.main.go_to(self.main.history_page))
@@ -1945,6 +2079,10 @@ class HomePage(QWidget):
         tile_special = self._tile(self.ICON_SPECIAL, "专项训练", "任选 A / B / C 篇目组合 · 免试音 · 进度独立", wide=True)
         tile_special.clicked.connect(lambda: self.load_and_start("special"))
         grid.addWidget(tile_special, 2, 0, 1, 2)
+        # 题库：通栏磁贴（占满两列），进入 WakuDemo 创意工坊共享题目库（更多题目请移步 QQ 群）
+        tile_bank = self._tile(self.ICON_BANK, "题库", "创意工坊共享题目包 · 联网下载导入 · 更多请加QQ群", wide=True)
+        tile_bank.clicked.connect(lambda: self.main.go_to(self.main.bank_page))
+        grid.addWidget(tile_bank, 3, 0, 1, 2)
 
         grid_row = QHBoxLayout()
         grid_row.addStretch(1)
@@ -2038,17 +2176,15 @@ class HomePage(QWidget):
         return b
 
     def load_and_start(self, mode):
-        path, _ = QFileDialog.getOpenFileName(self, "选择 .solo 文件", "", "SoloTalk 文件 (*.solo)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择题目包", "",
+            "全部题目包 (*.solo *.zip);;SoloTalk 题目包 (*.solo);;ZIP 压缩包 (*.zip)")
         if not path:
             return
         try:
-            with zipfile.ZipFile(path, 'r') as zf:
-                with zf.open('data.json') as f:
-                    data = json.load(f)
-                temp_dir = tempfile.mkdtemp(prefix="solotalk_")
-                zf.extractall(temp_dir)
-                self.main.current_package.from_dict(data, base_dir=temp_dir)
-                self.main.current_package.meta['temp_dir'] = temp_dir
+            data, temp_dir, base_dir = _open_package_zip(path)
+            self.main.current_package.from_dict(data, base_dir=base_dir)
+            self.main.current_package.meta['temp_dir'] = temp_dir
             # 专项训练：先让用户选篇目，再按选定篇目裁剪题目包数据
             if mode == "special":
                 dlg = SpecialPartsDialog(self.main.current_package, self)
@@ -2613,7 +2749,7 @@ class EditorPage(QWidget):
             self.author_edit.setReadOnly(True)
             self.anonymous_check.setEnabled(False)
         btn_new = QPushButton("新建")
-        btn_open = QPushButton("打开 .solo")
+        btn_open = QPushButton("打开题目包")
         btn_save = QPushButton("保存")
         btn_back = QPushButton("返回主页")
         top_bar.addWidget(QLabel("名称："))
@@ -2658,16 +2794,14 @@ class EditorPage(QWidget):
         self.partC_widget.refresh()
 
     def open_package(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开 .solo 文件", "", "SoloTalk 文件 (*.solo)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开题目包", "",
+            "全部题目包 (*.solo *.zip);;SoloTalk 题目包 (*.solo);;ZIP 压缩包 (*.zip)")
         if path:
             try:
-                with zipfile.ZipFile(path, 'r') as zf:
-                    with zf.open('data.json') as f:
-                        data = json.load(f)
-                    temp_dir = tempfile.mkdtemp(prefix="solotalk_")
-                    zf.extractall(temp_dir)
-                    self.pkg.from_dict(data, base_dir=temp_dir)
-                    self.pkg.meta['temp_dir'] = temp_dir
+                data, temp_dir, base_dir = _open_package_zip(path)
+                self.pkg.from_dict(data, base_dir=base_dir)
+                self.pkg.meta['temp_dir'] = temp_dir
                 self.name_edit.setText(self.pkg.meta.get("name", ""))
                 self.author_edit.setText(self.pkg.meta.get("author", ""))
                 self.anonymous_check.setChecked(self.pkg.meta.get("anonymous", False))
@@ -2684,7 +2818,10 @@ class EditorPage(QWidget):
                 QMessageBox.critical(self, "错误", f"打开失败：{str(e)}")
 
     def save_package(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存 .solo 文件", "", "SoloTalk 文件 (*.solo)")
+        # ❗保存类型分两条、.solo 在前：第一条决定"用户没写扩展名时自动补的后缀" → 默认存 .solo
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存题目包", "",
+            "SoloTalk 题目包 (*.solo);;ZIP 压缩包 (*.zip)")
         if not path:
             return
         self.pkg.meta["name"] = self.name_edit.text() or "Untitled"
@@ -4936,6 +5073,700 @@ class PracticePage(QWidget):
         with open(os.path.join(HISTORY_DIR, fname), 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2, ensure_ascii=False, default=str)
 
+# ------------------ 题目库（WakuDemo 创意工坊「对外只读接口」） ------------------
+# ⚠️ 共用只读账号 KEY：WakuDemo 创意工坊对外只读接口凭证，所有用户共享同一把（单号）。
+#    只用于拉列表 / 取下载直链，无任何写权限；接口只返回 state=Approved 的作品。
+WS_API_BASE = "https://wakudemo.cn/api/v1/external/workshop"
+WS_GAME_ID  = "101818"
+WS_KEY      = "waku_ws_c88eb836f7010edcd18886956b38d4c0d96f4670a3095ada4072fe54ca50f2df"
+WS_PAGE_SIZE = 20   # 列表接口单页条数（题库页按「加载更多」翻页，避免一次拉满）
+
+
+def _workshop_zip_path(title):
+    """题库下载目录中，某题目（按标题）对应的本地 .zip 完整路径。
+
+    下载落盘与「是否已下载」检测共用同一套命名规则，保证一致。
+    """
+    safe = re.sub(r'[\\/:*?"<>|\r\n]+', '_', title or "package").strip() or "package"
+    return os.path.join(WORKSHOP_DIR, f"{safe}.zip")
+
+
+class QuestionBankLoader(QThread):
+    """后台拉取创意工坊题目列表 / 下载题目包。
+
+    沿用 UpdateChecker 的「QThread + urllib.request」后台网络线程模式（App 内未用 requests）。
+    只读接口必须带 `X-Workshop-Key` 请求头；下载直链（COS 上海签名 url）有效期 300s，拿直链后 GET 不再需要 key。
+    """
+    got_list = pyqtSignal(list, int)          # items, total
+    list_failed = pyqtSignal(str)
+    got_download = pyqtSignal(str)            # 落盘后的本地 .zip 路径
+    download_failed = pyqtSignal(str)
+    download_progress = pyqtSignal(int, int)  # 已下载字节, 总字节(0=未知)
+
+    def __init__(self, mode, item=None, page=1, parent=None):
+        super().__init__(parent)
+        self.mode = mode                      # "list" | "download"
+        self.item = item or {}
+        self.page = page                      # list 模式：要拉的页码（1 起）
+
+    def _get_json(self, url, with_key=True):
+        headers = {"User-Agent": f"SoloTalk/{APP_VERSION}"}
+        if with_key:
+            headers["X-Workshop-Key"] = WS_KEY
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _get_bytes_to_file(self, url, out_dir):
+        """流式下载到 out_dir 下的 .part 临时文件，边下边算 sha256，返回 (tmp_path, sha256_hex)。
+
+        ⚠️ .part 必须落在**目标目录内**（与最终 .zip 同盘），否则 `os.replace` 会报
+        WinError 17「系统无法将文件移到不同的磁盘驱动器」（%TEMP% 在 C:，题库目录可能在 G:）。
+        """
+        req = urllib.request.Request(url, headers={"User-Agent": f"SoloTalk/{APP_VERSION}"})
+        total = 0
+        h = hashlib.sha256()
+        tmp = os.path.join(
+            out_dir,
+            f".solotalk_dl_{os.getpid()}_{int(time.time() * 1000)}.part",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                try:
+                    total = int(resp.headers.get("Content-Length", "0") or "0")
+                except ValueError:
+                    total = 0
+                downloaded = 0
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        h.update(chunk)
+                        downloaded += len(chunk)
+                        self.download_progress.emit(downloaded, total)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        return tmp, h.hexdigest()
+
+    def run(self):
+        try:
+            if self.mode == "list":
+                url = (f"{WS_API_BASE}/games/{WS_GAME_ID}/items"
+                       f"?page={self.page}&size={WS_PAGE_SIZE}")
+                data = self._get_json(url)
+                items = data.get("items", [])
+                total = data.get("total", len(items))
+                self.got_list.emit(items, total)
+            elif self.mode == "download":
+                item_id = self.item["id"]
+                url = f"{WS_API_BASE}/games/{WS_GAME_ID}/items/{item_id}/download"
+                info = self._get_json(url)
+                dl_url = info.get("url")
+                if not dl_url:
+                    raise ValueError("接口未返回下载直链")
+                expected_sha = (info.get("sha256") or "").strip().lower()
+                # 目标目录先建好，.part 直接下到该目录内 → 同盘，os.replace 不会跨盘失败
+                out_dir = WORKSHOP_DIR
+                os.makedirs(out_dir, exist_ok=True)
+                path = _workshop_zip_path(self.item.get("title"))
+                tmp, actual_sha = self._get_bytes_to_file(dl_url, out_dir)
+                if expected_sha and actual_sha != expected_sha:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    raise ValueError("下载文件 sha256 校验失败（可能被篡改或下载不完整）")
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+                os.replace(tmp, path)
+                self.got_download.emit(path)
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            if self.mode == "list":
+                self.list_failed.emit(msg)
+            else:
+                self.download_failed.emit(msg)
+
+
+class _FadeTextButton(QWidget):
+    """自定义按钮：常态显示 base_text，悬停时**平滑交叉淡化**切换为 hover_text，点击触发回调。
+
+    用于题库页「已下载」按钮：悬停文字平滑切换为「重新下载」。
+    实现：自绘 `paintEvent` + 自定义 `fade` 属性(0→1) + `QPropertyAnimation`。
+    ⚠️ 刻意**不用 QGraphicsOpacityEffect** —— 它在 QScrollArea 中滚出再滚回会整块消失
+       （Qt 已知的重绘 bug，用户实测「触发动画后滚动回去按钮不见了」）。
+    """
+
+    def __init__(self, base_text, hover_text, bg, border, text_color, on_click, parent=None):
+        super().__init__(parent)
+        self._base_text = base_text
+        self._hover_text = hover_text
+        self._bg = QColor(bg)
+        self._bd = QColor(border)
+        self._fg = QColor(text_color)
+        self._fade = 0.0            # 0 = 显示 base，1 = 显示 hover
+        self._on_click = on_click
+        self.setCursor(Qt.PointingHandCursor)
+        _bind_font(self, 13)        # 让 self.font() 就是 13px 界面字体，供 paintEvent 用
+        self._anim = QPropertyAnimation(self, b"fade", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+    # 自定义动画属性：改值即触发重绘
+    def _get_fade(self):
+        return self._fade
+
+    def _set_fade(self, value):
+        self._fade = float(value)
+        self.update()
+
+    fade = pyqtProperty(float, _get_fade, _set_fade)
+
+    def _animate(self, to_hover):
+        self._anim.stop()
+        self._anim.setStartValue(self._fade)
+        self._anim.setEndValue(1.0 if to_hover else 0.0)
+        self._anim.start()
+
+    def enterEvent(self, event):
+        self._animate(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._on_click:
+            self._on_click()
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        p.setPen(QPen(self._bd, 1))
+        p.setBrush(self._bg)
+        p.drawRoundedRect(rect, 8, 8)
+        p.setFont(self.font())
+        p.setPen(self._fg)
+        p.setOpacity(1.0 - self._fade)
+        p.drawText(self.rect(), Qt.AlignCenter, self._base_text)
+        p.setOpacity(self._fade)
+        p.drawText(self.rect(), Qt.AlignCenter, self._hover_text)
+        p.end()
+
+
+class QuestionBankPage(QWidget):
+    """题目库页：拉取 WakuDemo 创意工坊共享题目包列表，点击即可下载并导入本地练习。
+
+    只读接口拉不到自己私有的未审核作品（只回传 state=Approved），符合「共享题库」定位。
+    顶部横幅 + 底部说明均提示「更多题目请移步 QQ 群」。
+    """
+
+    # 设计 token（与 HomePage 同源配色）
+    ACCENT      = "#66CCFF"
+    ACCENT_DEEP = "#0A9BE0"
+    ACCENT_SOFT = "#E8F6FF"
+    BG_TOP      = "#F7FBFF"
+    BG_BOT      = "#EDF6FC"
+    CARD_BG     = "#FFFFFF"
+    CARD_BD     = "#E3ECF3"
+    TEXT        = "#1A2B3C"
+    TEXT_SUB    = "#7A8A9A"
+    # 2×2 网格图标 = 「题库 / 应用库」语义
+    ICON_BANK   = ["M4 5h7v6H4z", "M13 5h7v6h-7z", "M4 13h7v6H4z", "M13 13h7v6h-7z"]
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main = main_window
+        self.setObjectName("bankRoot")
+        self.setStyleSheet(
+            f"#bankRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f" stop:0 {self.BG_TOP}, stop:1 {self.BG_BOT}); }}")
+        self._items = []
+        self._loaded = False
+        self._page = 0            # 已加载到第几页
+        self._total = 0           # 接口报告的总条数
+        self._more_btn = None     # 「加载更多」按钮
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(32, 24, 32, 20)
+        root.setSpacing(14)
+
+        # ── 标题行（左：标题 + 副标题；右上角：返回主页）──
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head_left = QVBoxLayout()
+        head_left.setSpacing(2)
+        title = QLabel("题目库")
+        _bind_font(title, 22, medium=True)
+        title.setStyleSheet(f"color:{self.TEXT}; background:transparent;")
+        sub = QLabel("来自 WakuDemo 创意工坊的共享题目包 · 联网即可下载导入")
+        _bind_font(sub, 13)
+        sub.setStyleSheet(f"color:{self.TEXT_SUB}; background:transparent;")
+        head_left.addWidget(title)
+        head_left.addWidget(sub)
+        head.addLayout(head_left, 1)
+        self.back_btn = QPushButton("返回主页")
+        self.back_btn.setCursor(Qt.PointingHandCursor)
+        _bind_font(self.back_btn, 13)
+        self.back_btn.setStyleSheet(
+            f"QPushButton {{ background:{self.CARD_BG}; border:1px solid {self.CARD_BD};"
+            f" border-radius:8px; padding:8px 16px; color:{self.TEXT}; }}"
+            f"QPushButton:hover {{ background:{self.ACCENT_SOFT}; color:{self.ACCENT_DEEP}; }}")
+        self.back_btn.clicked.connect(lambda: self.main.go_to(self.main.home_page))
+        head.addWidget(self.back_btn, 0, Qt.AlignTop)
+        root.addLayout(head)
+
+        # ── 操作条 ──
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        _bind_font(self.refresh_btn, 13)
+        self.refresh_btn.setStyleSheet(
+            f"QPushButton {{ background:{self.CARD_BG}; border:1px solid {self.CARD_BD};"
+            f" border-radius:8px; padding:8px 16px; color:{self.ACCENT_DEEP}; }}"
+            f"QPushButton:hover {{ background:{self.ACCENT_SOFT}; }}")
+        self.refresh_btn.clicked.connect(self.load_list)
+        bar.addWidget(self.refresh_btn)
+        self.status_lbl = QLabel("")
+        _bind_font(self.status_lbl, 12)
+        self.status_lbl.setStyleSheet(f"color:{self.TEXT_SUB}; background:transparent;")
+        bar.addWidget(self.status_lbl)
+        bar.addStretch(1)
+        root.addLayout(bar)
+
+        # ── QQ 群提示横幅 ──
+        root.addWidget(self._make_qq_banner())
+
+        # ── 列表区（可滚动）──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
+        self.list_widget = QWidget()
+        self.list_lay = QVBoxLayout(self.list_widget)
+        self.list_lay.setContentsMargins(0, 0, 0, 0)
+        self.list_lay.setSpacing(12)
+        self.list_lay.addStretch(1)
+        scroll.setWidget(self.list_widget)
+        root.addWidget(scroll, 1)
+
+        # ── 底部说明 ──
+        foot = QLabel("更多题目请移步 QQ 群（群号 1091799764）。题库内容由创作者上传，"
+                      "下载后请自行核对题目质量；导入后即进入练习模式。")
+        _bind_font(foot, 12)
+        foot.setStyleSheet(f"color:{self.TEXT_SUB}; background:transparent;")
+        foot.setWordWrap(True)
+        root.addWidget(foot)
+
+        # ── 后台线程（懒创建，避免重复实例）──
+        self.loader = None
+
+    # ---------------- 组件 ----------------
+    def _make_qq_banner(self):
+        banner = QFrame()
+        banner.setObjectName("bankQqBanner")
+        banner.setStyleSheet(
+            f"#bankQqBanner {{ background:{self.ACCENT_SOFT}; border:1px solid {self.ACCENT};"
+            f" border-radius:10px; padding:6px 8px; }}")
+        lay = QHBoxLayout(banner)
+        lay.setContentsMargins(12, 6, 12, 6)
+        lay.setSpacing(10)
+        icon = QLabel()
+        icon.setPixmap(_svg_pixmap(self.ICON_BANK, self.ACCENT_DEEP, 22))
+        icon.setFixedSize(24, 24)
+        icon.setStyleSheet("background:transparent;")
+        lay.addWidget(icon)
+        txt = QLabel()
+        _bind_font(txt, 13, medium=True)
+        txt.setOpenExternalLinks(True)
+        txt.setTextFormat(Qt.RichText)
+        txt.setText(
+            '更多题目或想上传题目，请进 QQ 群（群号 1091799764）<br>'
+            '上传也可登录 <a href="https://wakudemo.cn/creator/workshop" '
+            'style="color:#0A9BE0; text-decoration:underline;">waku 平台</a> '
+            '在“创意工坊”处上传'
+        )
+        txt.setStyleSheet(f"color:{self.ACCENT_DEEP}; background:transparent;")
+        lay.addWidget(txt)
+        link = QPushButton("加入 QQ 群")
+        link.setCursor(Qt.PointingHandCursor)
+        _bind_font(link, 13)
+        link.setStyleSheet(
+            f"QPushButton {{ background:{self.ACCENT_DEEP}; border:none; border-radius:8px;"
+            f" padding:7px 14px; color:#FFFFFF; }}"
+            f"QPushButton:hover {{ background:#0b8bc9; }}")
+        link.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(MorePage.QQ_JOIN_URL)))
+        lay.addWidget(link)
+        lay.addStretch(1)
+        return banner
+
+    def _fmt_size(self, n):
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return "未知大小"
+        if n < 1024:
+            return f"{n} B"
+        if n < 1024 * 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{n / 1024 / 1024:.1f} MB"
+
+    def _fmt_date(self, s):
+        if not s:
+            return ""
+        # 接口返回 ISO 时间串，尽量截到「日期 时间」
+        s = s.replace("T", " ").replace("Z", "")
+        return s[:19] if len(s) >= 19 else s
+
+    def _check_local(self, item):
+        """仅按**文件名**判断本地下载状态（不在这里做哈希校验）。
+
+        返回 ("downloaded"|"missing", path)。
+        哈希校验的时机见 `import_local`：只在用户从「已下载」项点「开始练习」进入时才校验，
+        校验失败提示重新下载；而文件名检测只是决定按钮显示「已下载」还是「下载并导入」。
+        """
+        path = _workshop_zip_path(item.get("title"))
+        return ("downloaded", path) if os.path.isfile(path) else ("missing", path)
+
+    # ---------------- 数据加载 ----------------
+    def load_list(self):
+        """整表刷新：清空并从第 1 页重新拉取。"""
+        self._items = []
+        self._page = 0
+        self._total = 0
+        self.status_lbl.setText("正在拉取题目库…")
+        self.refresh_btn.setEnabled(False)
+        self._clear_list()
+        self._fetch_page(1, append=False)
+
+    def load_more(self):
+        """加载下一页，追加到列表末尾。"""
+        self.refresh_btn.setEnabled(False)
+        self.status_lbl.setText("正在加载更多…")
+        self._fetch_page(self._page + 1, append=True)
+
+    def _fetch_page(self, page, append):
+        loader = QuestionBankLoader("list", page=page)
+        loader.got_list.connect(
+            lambda items, total, p=page, a=append: self._on_list(items, total, p, a))
+        loader.list_failed.connect(
+            lambda msg, p=page, a=append: self._on_list_error(msg, p, a))
+        loader.finished.connect(lambda: self.refresh_btn.setEnabled(True))
+        loader.start()
+        self.loader = loader
+
+    def _on_list(self, items, total, page, append):
+        self._loaded = True
+        self._total = total
+        self._page = page
+        if append:
+            self._items.extend(items)
+        else:
+            self._items = list(items)
+        self._render_items()
+
+    def _render_items(self):
+        """按 self._items 重建整张列表，并**重新检测**每条的本地下载状态。
+
+        每次进入题库页 / 刷新都会走到这里：卡片按钮由「下载并导入」变为「已下载」，
+        退出练习再回来状态即可自动更新（不联网，纯本地文件检测）。
+        """
+        self._clear_list()
+        self._remove_more_btn()
+        if not self._items:
+            self.status_lbl.setText("题库暂无可下载题目（需联网且审核通过后才会出现在此）")
+            self._add_empty_hint()
+            return
+        # 每条只检测一次（避免重复算 sha256），结果同时用于按钮态与统计
+        checks = [self._check_local(it) for it in self._items]
+        for it, (state, _p) in zip(self._items, checks):
+            self._add_card(it, state)
+        done = sum(1 for s, _ in checks if s == "downloaded")
+        extra = f" · 已下载 {done} 个" if done else ""
+        self.status_lbl.setText(
+            f"共 {self._total} 个题目包（已显示 {len(self._items)} 个{extra}）")
+        if len(self._items) < self._total:
+            self._add_more_btn(self._total - len(self._items))
+
+    def _on_list_error(self, msg, page=1, append=False):
+        # 401 / 超时 / 断网 等
+        self.status_lbl.setText("")
+        if append:
+            # 已加载的卡片保留，只提示这次翻页失败
+            QMessageBox.warning(self, "加载失败", f"加载更多失败：\n{msg}")
+        else:
+            self._add_error_hint(msg)
+
+    # ---------------- 列表渲染 ----------------
+    def _clear_list(self):
+        # stretch 是最后一个（index = count-1），其余 widget 全部移除并销毁
+        while self.list_lay.count() > 1:
+            w = self.list_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self._more_btn = None
+
+    def _add_more_btn(self, remaining):
+        btn = QPushButton(f"加载更多（还有 {remaining} 个）")
+        btn.setCursor(Qt.PointingHandCursor)
+        _bind_font(btn, 13)
+        btn.setStyleSheet(
+            f"QPushButton {{ background:{self.CARD_BG}; border:1px solid {self.CARD_BD};"
+            f" border-radius:8px; padding:10px 16px; color:{self.ACCENT_DEEP}; }}"
+            f"QPushButton:hover {{ background:{self.ACCENT_SOFT}; }}")
+        btn.clicked.connect(self.load_more)
+        self.list_lay.insertWidget(self.list_lay.count() - 1, btn)
+        self._more_btn = btn
+
+    def _remove_more_btn(self):
+        btn = getattr(self, "_more_btn", None)
+        if btn is not None:
+            try:
+                self.list_lay.removeWidget(btn)
+                btn.deleteLater()
+            except RuntimeError:
+                pass
+            self._more_btn = None
+
+    def _add_empty_hint(self):
+        hint = QLabel("暂无题目。可在 WakuDemo 创意工坊上传自己的题目包，审核通过后即会出现在这里。")
+        _bind_font(hint, 13)
+        hint.setStyleSheet(f"color:{self.TEXT_SUB}; background:transparent;")
+        hint.setWordWrap(True)
+        self.list_lay.insertWidget(0, hint)
+
+    def _add_error_hint(self, msg):
+        box = QFrame()
+        box.setObjectName("bankErr")
+        box.setStyleSheet(
+            f"#bankErr {{ background:#FFF1F0; border:1px solid #FFCCC7; border-radius:10px;"
+            f" padding:14px 16px; }}")
+        lay = QVBoxLayout(box)
+        lay.setSpacing(6)
+        t = QLabel("拉取题目库失败")
+        _bind_font(t, 14, medium=True)
+        t.setStyleSheet("color:#cf1322; background:transparent;")
+        m = QLabel(msg)
+        _bind_font(m, 12)
+        m.setStyleSheet("color:#7a3b38; background:transparent;")
+        m.setWordWrap(True)
+        h = QLabel("请检查网络后点「刷新」重试。只读接口需联网，且服务器偶发超时属正常现象。")
+        _bind_font(h, 12)
+        h.setStyleSheet("color:#7a3b38; background:transparent;")
+        h.setWordWrap(True)
+        lay.addWidget(t)
+        lay.addWidget(m)
+        lay.addWidget(h)
+        self.list_lay.insertWidget(0, box)
+
+    def _add_card(self, item, state=None):
+        if state is None:
+            state, _p = self._check_local(item)
+        card = QFrame()
+        card.setObjectName("bankCard")
+        card.setStyleSheet(
+            f"#bankCard {{ background:{self.CARD_BG}; border:1px solid {self.CARD_BD};"
+            f" border-radius:12px; padding:14px 16px; }}")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(14)
+
+        # 左：图标
+        ic = QLabel()
+        ic.setFixedSize(40, 40)
+        ic.setAlignment(Qt.AlignCenter)
+        ic.setStyleSheet(
+            f"background:{self.ACCENT_SOFT}; border-radius:20px; border:none;")
+        ic.setPixmap(_svg_pixmap(self.ICON_BANK, self.ACCENT_DEEP, 22))
+        row.addWidget(ic)
+
+        # 中：标题 + 元信息
+        mid = QVBoxLayout()
+        mid.setSpacing(4)
+        name = QLabel(item.get("title") or "(无标题)")
+        _bind_font(name, 15, medium=True)
+        name.setStyleSheet(f"color:{self.TEXT}; background:transparent;")
+        meta = QLabel(
+            f"作者：{item.get('creatorName') or '匿名'}　|　"
+            f"{self._fmt_size(item.get('fileSize'))}　|　"
+            f"{self._fmt_date(item.get('createdAt'))}"
+        )
+        _bind_font(meta, 12)
+        meta.setStyleSheet(f"color:{self.TEXT_SUB}; background:transparent;")
+        mid.addWidget(name)
+        mid.addWidget(meta)
+        row.addLayout(mid, 1)
+
+        # 右：按钮区（按是否已下载分两种布局）
+        #  · 已下载：左侧「已下载」淡入淡出按钮（悬停→「重新下载」，点击触发重新下载）
+        #           + 右侧「开始练习」按钮（点击进入练习，此时才做 sha256 校验）。
+        #  · 未下载：单个「下载并导入」按钮。
+        state, _path = self._check_local(item)
+        if state == "downloaded":
+            btn_area = QHBoxLayout()
+            btn_area.setSpacing(10)
+            BTN_W, BTN_H = 104, 38   # 两个按钮统一尺寸，视觉对齐
+            # 「已下载」淡入淡出按钮：悬停平滑切换为「重新下载」，点击重新下载
+            fade = _FadeTextButton(
+                "已下载", "重新下载",
+                "#EAF7EE", "#B7E0C4", "#2E7D46",
+                lambda it=item: self.download_and_import(it),
+            )
+            fade.setFixedSize(BTN_W, BTN_H)
+            fade.setToolTip("点击重新下载本题库包")
+            # 「开始练习」按钮（置于「已下载」右侧，尺寸与「已下载」一致）
+            start = QPushButton("开始练习")
+            start.setCursor(Qt.PointingHandCursor)
+            _bind_font(start, 13)
+            start.setFixedSize(BTN_W, BTN_H)
+            start.setStyleSheet(
+                f"QPushButton {{ background:{self.ACCENT_DEEP}; border:none; border-radius:8px;"
+                f" padding:0px; color:#FFFFFF; }}"
+                f"QPushButton:hover {{ background:#0b8bc9; }}")
+            start.clicked.connect(lambda _=False, it=item: self.import_local(it))
+            btn_area.addWidget(fade)
+            btn_area.addWidget(start)
+            row.addLayout(btn_area)
+        else:
+            btn = QPushButton("下载并导入")
+            btn.setCursor(Qt.PointingHandCursor)
+            _bind_font(btn, 13)
+            btn.setStyleSheet(
+                f"QPushButton {{ background:{self.ACCENT_DEEP}; border:none; border-radius:8px;"
+                f" padding:9px 16px; color:#FFFFFF; }}"
+                f"QPushButton:hover {{ background:#0b8bc9; }}"
+                f"QPushButton:disabled {{ background:#BFD8E6; }}")
+            btn.clicked.connect(lambda _=False, it=item: self.download_and_import(it))
+            row.addWidget(btn)
+        self.list_lay.insertWidget(self.list_lay.count() - 1, card)
+
+    # ---------------- 下载 + 导入 ----------------
+    def download_and_import(self, item):
+        btn = self.sender()
+        if btn:
+            btn.setEnabled(False)
+            btn.setText("下载中…")
+        self.status_lbl.setText(f"正在下载「{item.get('title') or ''}」…")
+        loader = QuestionBankLoader("download", item=item)
+        loader.got_download.connect(lambda p: self._on_downloaded(p, item))
+        loader.download_failed.connect(lambda m: self._on_download_error(m, item))
+        loader.download_progress.connect(lambda d, t: self._on_progress(d, t, item))
+        loader.finished.connect(lambda: None)
+        loader.start()
+        # 记到本地便于出错时定位（不阻塞）
+        self._active_loader = loader
+
+    def _on_progress(self, done, total, item):
+        if total and total > 0:
+            pct = int(done / total * 100)
+            self.status_lbl.setText(f"正在下载「{item.get('title') or ''}」… {pct}%")
+        else:
+            self.status_lbl.setText(f"正在下载「{item.get('title') or ''}」… {done // 1024} KB")
+
+    def _on_downloaded(self, path, item):
+        self.status_lbl.setText("下载完成，正在导入…")
+        self._do_import(path, item)
+
+    def import_local(self, item):
+        """从「已下载」项点「开始练习」→ 导入本地题目包并进入练习。
+
+        ⚠️ 哈希校验**只在这里做**（用户从已下载题库进入练习时）：比对本地文件实算 sha256
+        与接口 `sha256` 字段，不一致说明本地文件损坏/被改 → 弹「建议重新下载」Fluent 弹窗，
+        可选「重新下载」（重新拉一份）或「无视风险，开始练习」（忽略校验直接进入）。
+        """
+        path = _workshop_zip_path(item.get("title"))
+        if not os.path.isfile(path):
+            FluentMessageDialog(
+                self, "文件不存在",
+                "本地题目包已不存在，请点「刷新」后重新下载。",
+                icon=D_ICON_WARN,
+                buttons=(("知道了", "primary", "ok"),),
+            ).exec_()
+            self._render_items()
+            return
+        expected = (item.get("sha256") or "").strip().lower()
+        if expected:
+            try:
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+                if h.hexdigest().lower() != expected:
+                    dlg = FluentMessageDialog(
+                        self, "建议重新下载",
+                        "本地题目包与线上版本不一致（可能已损坏）。\n"
+                        "建议重新下载后再开始练习。",
+                        informative="你也可以无视风险，直接开始练习（题目可能不完整或异常）。",
+                        icon=D_ICON_WARN,
+                        buttons=(
+                            ("重新下载", "primary", "redownload"),
+                            ("无视风险，开始练习", "secondary", "ignore"),
+                        ),
+                        default_key="redownload",
+                    )
+                    dlg.exec_()
+                    if dlg.clicked_key == "redownload":
+                        self.download_and_import(item)   # 重新拉一份覆盖本地
+                    elif dlg.clicked_key == "ignore":
+                        self._do_import(path, item)      # 忽略校验、直接进入练习
+                    return
+            except OSError:
+                FluentMessageDialog(
+                    self, "读取失败",
+                    "本地题目包读取失败，请点「已下载」按钮重新下载。",
+                    icon=D_ICON_WARN,
+                    buttons=(("知道了", "primary", "ok"),),
+                ).exec_()
+                return
+        self._do_import(path, item)
+
+    def _do_import(self, path, item):
+        try:
+            data, temp_dir, base_dir = _open_package_zip(path)
+            self.main.current_package = SoloPackage()
+            self.main.current_package.from_dict(data, base_dir=base_dir)
+            self.main.current_package.meta['temp_dir'] = temp_dir
+            self.main.practice_page.pkg = self.main.current_package
+            self.main.practice_page.set_mode("practice", None)
+            self.main.go_to(self.main.practice_page)
+            self.main.practice_page._check_and_prompt_progress()
+            self.status_lbl.setText("")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败",
+                                 f"题目包「{item.get('title') or ''}」导入失败：\n{str(e)}")
+            self.status_lbl.setText("")
+
+    def _on_download_error(self, msg, item):
+        QMessageBox.critical(self, "下载失败",
+                             f"题目包「{item.get('title') or ''}」下载失败：\n{msg}")
+        self.status_lbl.setText("")
+        self._render_items()  # 重建卡片，按钮复位（保留已加载的分页）
+
+    # ---------------- 生命周期 ----------------
+    def showEvent(self, event):
+        # 首次进入：联网拉一次列表；之后每次进入（如退出练习再回来）：重建卡片并重算
+        # 「已下载」状态（纯本地 sha256 校验，不联网），保证状态及时更新。
+        if not self._loaded:
+            self.load_list()
+        elif self._items:
+            self._render_items()
+        super().showEvent(event)
+
+
 # ------------------ 历史记录页面 ------------------
 class HistoryPage(QWidget):
     # 分类徽标配色（与详情页 _d_chip 同一体系：浅底 + 细描边 + 深字）
@@ -6178,7 +7009,7 @@ def load_vosk_model():
     return Model(MODEL_PATH)
 
 # ===== 更新检查（仅提示，不自动下载/替换）=====
-APP_VERSION = "2.2"   # 当前版本号；发布新版本时只改这一处
+APP_VERSION = "2.3"   # 当前版本号；发布新版本时只改这一处
 # version.json 放在 GitHub 仓库根目录。更新源顺序：
 #   1) GitHub API：读实时文件、无 CDN 缓存，改完立即生效（优先）；
 #   2) jsDelivr：国内直连快，但有缓存，作兜底；
