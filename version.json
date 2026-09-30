@@ -1,12 +1,12 @@
 {
   "desktop": {
-    "version": "2.2",
-    "notes": "2.2：请解压使用① 练习历史记录页改为三列结构化视图（标题｜分类｜时间），默认按时间倒序、点表头可排序；② 新增专项模式！！！！！可单独练ABC；③ 练习详情改用卡片式排版，更清爽；",
-    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.2-desktop/SoloTalk_v2.2.7z"
+    "version": "2.3",
+    "notes": "2.3：（请解压使用）① 题库页接入 WakuDemo 创意工坊只读接口——联网拉题目列表、分页加载、下载导入、按文件名判已下载 + 开始练习时 sha256 校验；② 弹窗统一改为 Fluent 风格（与首页一致），弃用系统原生按钮；③ 题库页 QQ 群横幅提示「更多题目或想上传题目，请进 QQ 群」，并附 waku 平台创意工坊上传超链接。",
+    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.3-desktop/SoloTalk_v2.3.7z"
   },
   "mobile": {
-    "version": "2.5",
-    "notes": "2.0：与电脑版同步——电脑回答三页拆分、新增「检查更新」提示、录音界面修复等。请前往应用商店/发布页更新。",
-    "url": "https://github.com/FallingLighty/SoloTalk/releases/tag/v2.0-mobile"
+    "version": "2.1",
+    "notes": "2.1：四大特性（专项模式 / 历史筛选 / 更多重设计 / 字体个性化）、首页顺序调整（模考→专项→练习）",
+    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.1-mobile/SoloTalk-rebuild_v2.1.apk"
   }
 }
