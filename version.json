@@ -5,7 +5,7 @@
     "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.3-desktop/SoloTalk_v2.3.7z"
   },
   "mobile": {
-    "version": "2.1",
+    "version": "2.5",
     "notes": "2.1：四大特性（专项模式 / 历史筛选 / 更多重设计 / 字体个性化）、首页顺序调整（模考→专项→练习）",
     "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.1-mobile/SoloTalk-rebuild_v2.1.apk"
   }
