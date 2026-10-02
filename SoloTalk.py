@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-SoloTalk 2.3 — 单机版听说模考编辑器
+SoloTalk 2.4 — 单机版听说模考编辑器
 依赖安装：pip install PyQt5 pyttsx3 sounddevice vosk python-vlc numpy fastembed edge-tts
 （edge-tts 为高质量神经语音，需联网；未安装或断网时自动回退系统 SAPI5 语音）
 所有控制台输出（print / 异常栈 / 崩溃栈）都会同步写入 _solo_diag.log（打包后写用户主目录），方便无控制台环境排查。
@@ -985,7 +985,8 @@ def _partB_slots_as_ordered(partB_raw):
     return b3, b5
 
 
-def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
+def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None,
+                        progress_cb=None):
     """对一份录音（recordings 字典）做离线批改，返回 eval_result。
     统一了「考试结束实时批改」与「历史记录重新批改」两条路径，避免逻辑分叉。
     Part B 跳过/未录音的空槽位记 0.0 相似度，不抛异常。
@@ -999,9 +1000,39 @@ def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
                   'partB_three': {0: bool, 1: bool, ...},   # 按题目序号
                   'partB_five':  {0: bool, ...},
                   'partC': bool}
-                 为 None 时表示「全部重新批改」（实时批改场景）。"""
+                 为 None 时表示「全部重新批改」（实时批改场景）。
+      progress_cb: 可选回调 progress_cb(step, total, label)，每处理一个槽位（Part/小题）前
+                   调用一次，用于后台线程上报进度（step 从 1 起，total 为本次批改总槽位数）。
+                   为 None 时退化为无进度上报。"""
     eval_result = dict(existing_eval) if existing_eval else {}
     _all = (selection is None)
+
+    # 槽位展开 + 进度统计（供后台批改线程上报；progress_cb=None 时退化为无进度）
+    # ⚠️ 必须在第一个 _tick() 调用之前完成，否则会 UnboundLocalError。
+    b3, b5 = _partB_slots_as_ordered(recs.get('partB', {}))
+    n3 = len(pkg.partB_three_questions)
+    n5 = len(pkg.partB_five_answers)
+    sel3 = selection.get('partB_three') if selection else None
+    sel5 = selection.get('partB_five') if selection else None
+    _prog_step = 0
+    if _all:
+        _prog_total = 1 + len(b3) + len(b5) + 1      # A + 三问 + 五答 + C
+    else:
+        _prog_total = 0
+        if selection.get('partA'):
+            _prog_total += 1
+        _prog_total += sum(1 for i in range(len(b3)) if (sel3 or {}).get(i))
+        _prog_total += sum(1 for i in range(len(b5)) if (sel5 or {}).get(i))
+        if selection.get('partC'):
+            _prog_total += 1
+    def _tick(label):
+        nonlocal _prog_step
+        _prog_step += 1
+        if progress_cb:
+            try:
+                progress_cb(_prog_step, _prog_total, label)
+            except Exception:
+                pass
 
     # 尝试加载 BGE 嵌入模型（懒加载，仅首次调用时初始化）
     bge = _get_bge_model()
@@ -1012,6 +1043,7 @@ def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
 
     # ── Part A ──
     if _all or (selection.get('partA')):
+        _tick("Part A 模仿朗读")
         if recs.get('partA'):
             hyp = recognize_audio_file(recs['partA'], model)
             wer, acc = levenshtein_wer(pkg.partA_hidden_text, hyp)
@@ -1021,17 +1053,12 @@ def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
     elif 'partA' not in eval_result:
         eval_result['partA'] = {'recognized': '', 'wer': 1.0, 'accuracy': 0.0}
 
-    b3, b5 = _partB_slots_as_ordered(recs.get('partB', {}))
-    n3 = len(pkg.partB_three_questions)
-    n5 = len(pkg.partB_five_answers)
-    sel3 = selection.get('partB_three') if selection else None
-    sel5 = selection.get('partB_five') if selection else None
-
     # ── Part B 三问 ──
     old3 = eval_result.get('partB_three', [])
     new3 = []
     for i, rec in enumerate(b3):
         if _all or (sel3 and sel3.get(i)):
+            _tick(f"Part B 三问 {i+1}")
             ref = pkg.partB_three_questions[i].get('hidden_answer', '') if i < n3 else ''
             hyp = recognize_audio_file(rec, model) if rec else ""
             if bge and rec and ref.strip() and hyp.strip():
@@ -1048,6 +1075,7 @@ def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
     new5 = []
     for i, rec in enumerate(b5):
         if _all or (sel5 and sel5.get(i)):
+            _tick(f"Part B 五答 {i+1}")
             ref = pkg.partB_five_answers[i].get('hidden_answer', '') if i < n5 else ''
             hyp = recognize_audio_file(rec, model) if rec else ""
             if bge and rec and ref.strip() and hyp.strip():
@@ -1061,6 +1089,7 @@ def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
 
     # ── Part C ──
     if _all or (selection.get('partC')):
+        _tick("Part C 故事复述")
         if recs.get('partC'):
             hyp = recognize_audio_file(recs['partC'], model)
             scores, use_sem = _partC_point_scores(hyp, pkg.partC_key_points, bge)
@@ -1080,6 +1109,218 @@ def evaluate_recordings(recs, pkg, model, existing_eval=None, selection=None):
         eval_result['partC'] = {'recognized': '', 'coverage': '0/0', 'semantic_sim': 0.0}
 
     return eval_result
+
+
+# ------------------ 后台批改（进度环 + 进度条） ------------------
+# 批改 = Vosk 离线识别 + BGE 语义相似度，纯 CPU 且按槽位串行，单份录音常需数秒。
+# 原先同步跑会冻结 UI 且无任何反馈；改为 QThread 后台跑 + 模态进度框
+#（旋转环动画 + 步进进度条），与 QuestionBankLoader / UpdateChecker 同套线程模式。
+class GradingWorker(QThread):
+    """后台执行 evaluate_recordings，逐槽位通过 progress 信号上报进度。"""
+    progress = pyqtSignal(int, int, str)      # step, total, label
+    finished = pyqtSignal(object)             # eval_result
+    errored  = pyqtSignal(str)                # 异常信息
+
+    def __init__(self, recs, pkg, model, existing_eval=None, selection=None, parent=None):
+        super().__init__(parent)
+        self._recs = recs
+        self._pkg = pkg
+        self._model = model
+        self._existing_eval = existing_eval
+        self._selection = selection
+
+    def run(self):
+        try:
+            result = evaluate_recordings(
+                self._recs, self._pkg, self._model,
+                existing_eval=self._existing_eval, selection=self._selection,
+                progress_cb=lambda s, t, l: self.progress.emit(s, t, l))
+            self.finished.emit(result)
+        except Exception as e:  # 批改异常不能静默吞掉
+            import traceback
+            traceback.print_exc()
+            self.errored.emit(str(e))
+
+
+class _SpinnerRing(QWidget):
+    """单色线性旋转加载环（Fluent 风，无外部资源，靠 QPainter 画 300° 弧 + QTimer 旋转）。"""
+    def __init__(self, color=None, size=46, parent=None):
+        super().__init__(parent)
+        self._color = QColor(color if color is not None else D_ACCENT_DEEP)
+        self.setFixedSize(size, size)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._spin)
+
+    def start(self):
+        if not self._timer.isActive():
+            self._timer.start(16)
+
+    def stop(self):
+        self._timer.stop()
+        self.update()
+
+    def _spin(self):
+        self._angle = (self._angle + 12) % 360
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.translate(self.width() / 2, self.height() / 2)
+        p.rotate(self._angle)
+        r = min(self.width(), self.height()) // 2 - 4
+        pen = QPen(self._color, 4, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(-r, -r, 2 * r, 2 * r, 30 * 16, 300 * 16)
+        p.end()
+
+
+class GradingProgressDialog(QDialog):
+    """「离线批改中」模态进度框：旋转环动画 + 步进进度条 + 当前步骤文字。
+
+    默认不可手动关闭；仅在用户主动点「放弃批改」并经确认后，通过
+    `abandon_requested` 信号通知外部强制终止后台线程，随后 reject 退出。
+    """
+    abandon_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = True
+        self._abandoned = False
+        self.setWindowTitle("离线批改中")
+        self.setModal(True)
+        self.setFixedSize(380, 250)
+        self.setWindowFlags(self.windowFlags()
+                            & ~Qt.WindowCloseButtonHint
+                            & ~Qt.WindowContextHelpButtonHint)
+        self.setObjectName("gpRoot")
+        self.setStyleSheet(
+            f"#gpRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f" stop:0 {D_BG_TOP}, stop:1 {D_BG_BOT}); }}")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 22)
+        root.setSpacing(18)
+
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        self._ring = _SpinnerRing()
+        top.addWidget(self._ring, 0, Qt.AlignTop)
+        rcol = QVBoxLayout()
+        rcol.setSpacing(8)
+        rcol.addWidget(_d_label("离线批改中…", 17, D_TEXT, medium=True, wrap=False))
+        self._step = _d_label("正在准备…", 13, D_SUB, wrap=True)
+        rcol.addWidget(self._step)
+        rcol.addStretch(1)
+        top.addLayout(rcol, 1)
+        root.addLayout(top)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 1)
+        self._bar.setValue(0)
+        self._bar.setTextVisible(True)
+        self._bar.setFormat("%v / %m")
+        self._bar.setFixedHeight(16)
+        self._bar.setStyleSheet(
+            "QProgressBar{background:#E3ECF3;border:none;border-radius:8px;"
+            "text-align:center;color:#5A6B7B;font-size:11px;}"
+            "QProgressBar::chunk{background:%s;border-radius:8px;}" % D_ACCENT)
+        root.addWidget(self._bar)
+
+        # 放弃批改（危险样式，居中）—— 卡死时的唯一退出通道
+        self._abandon_btn = QPushButton("放弃批改")
+        self._abandon_btn.setFixedHeight(36)
+        self._abandon_btn.setCursor(Qt.PointingHandCursor)
+        self._abandon_btn.setStyleSheet(
+            "QPushButton{background:transparent;border:1px solid #E6A6A6;"
+            "border-radius:9px;color:#C0392B;font-size:13px;}"
+            "QPushButton:hover{background:#FDECEA;}"
+            "QPushButton:pressed{background:#F8D7D3;}")
+        self._abandon_btn.clicked.connect(self._ask_abandon)
+        root.addWidget(self._abandon_btn, 0, Qt.AlignHCenter)
+
+        self._ring.start()
+
+    def _ask_abandon(self):
+        box = FluentMessageDialog(
+            self, "放弃本次批改？",
+            "批改程序正在后台运行，放弃后将强制停止并退出，本次评分不会被保存。",
+            informative="已完成的批改进度会丢失，稍后可在历史记录中重新批改。",
+            icon=D_ICON_WARN,
+            buttons=(("取消", "secondary", "cancel"),
+                     ("放弃批改", "danger", "abandon")),
+            default_key="cancel")
+        box.exec_()
+        if box.clicked_key == "abandon":
+            self._abandoned = True
+            self._running = False
+            self._ring.stop()
+            self.abandon_requested.emit()
+            self.reject()
+
+    def on_progress(self, step, total, label):
+        if total > 0 and self._bar.maximum() != total:
+            self._bar.setRange(0, total)
+        self._bar.setValue(step)
+        self._step.setText(f"<span style='color:{D_SUB}'>{_esc(label)}</span>")
+        self._step.update()
+
+    def finish(self):
+        self._running = False
+        self._ring.stop()
+        self.accept()
+
+    def closeEvent(self, ev):
+        if self._running:
+            ev.ignore()
+        else:
+            super().closeEvent(ev)
+
+
+def grade_with_progress(parent, recs, pkg, vosk_model,
+                        existing_eval=None, selection=None):
+    """后台线程跑 evaluate_recordings，期间弹「批改中」进度框（旋转环 + 进度条）。
+
+    返回 eval_result；若批改过程抛异常，弹错误提示并返回 None。
+    调用方负责在拿到结果后做存历史 / 写回文件等后续动作。
+    """
+    dlg = GradingProgressDialog(parent)
+    worker = GradingWorker(recs, pkg, vosk_model,
+                          existing_eval=existing_eval, selection=selection,
+                          parent=parent)
+    _result = {}
+    _err = [None]
+
+    def _on_abandon():
+        # Vosk 的 recognize_audio_file 是阻塞式 C 调用，无法被 Python 信号 /
+        # threading.Event 中断，唯一退出手段是强制结束线程。被放弃后应用仍要
+        # 继续，故此处硬杀（可能使复用的 vosk_model 状态变脏，必要时重启程序
+        # 即可；放弃本就是极端兜底通道）。
+        worker.terminate()
+
+    dlg.abandon_requested.connect(_on_abandon)
+    worker.progress.connect(dlg.on_progress)
+    worker.finished.connect(
+        lambda ev: (_result.__setitem__('ev', ev), dlg.finish()))
+    worker.errored.connect(
+        lambda e: (_err.__setitem__(0, e), dlg.finish()))
+    worker.start()
+    dlg.exec_()
+
+    if dlg._abandoned:
+        # 用户放弃：确保后台线程已结束，返回 None（调用方按"无结果"处理）。
+        worker.terminate()
+        worker.wait(3000)
+        return None
+
+    worker.wait(5000)
+    if _err[0] is not None:
+        QMessageBox.warning(parent, "批改失败",
+                            f"批改过程出错：{_err[0]}\n录音已保存，稍后可重新批改。")
+        return None
+    return _result.get('ev')
+
 
 # ------------------ 题目包读写（.solo 与 .zip 本质都是 zip） ------------------
 def _open_package_zip(path):
@@ -1109,7 +1350,7 @@ class SoloPackage:
     def __init__(self):
         self.meta = {
             "name": "Untitled",
-            "version": "2.3",
+            "version": "2.4",
             "created": datetime.datetime.now().isoformat(),
             "author": "",
             "anonymous": False
@@ -1293,16 +1534,54 @@ class MainWindow(QMainWindow):
                 return
         event.accept()
 
-    def _check_update(self):
-        """后台检查更新；有新版时弹出提示对话框（不自动下载/安装）。"""
+    def _check_update(self, manual=False):
+        """后台检查更新（不自动下载/安装）。
+
+        manual=False：启动时自动检查 —— 仅「有新版」弹提示框，其余静默。
+        manual=True ：用户点「检查更新」—— 无论结果（有新版本 / 已是最新 / 检查失败）
+                      都给反馈，避免"点了没反应"。
+        """
         if getattr(self, "_updater", None) and self._updater.isRunning():
-            return  # 避免重复触发
+            # 正在检查：手动点击则记下"要提示"，等这次结果回来一起给
+            if manual:
+                self._updater_manual = True
+            return
+        self._updater_manual = bool(manual)
         self._updater = UpdateChecker()
         self._updater.update_available.connect(self.show_update_dialog)
+        self._updater.no_update.connect(self._on_update_none)
+        self._updater.check_failed.connect(self._on_update_failed)
         self._updater.start()
+
+    def _on_update_none(self):
+        """检查完成：已是最新。启动自动检查时静默；手动点击时给提示。"""
+        if not getattr(self, "_updater_manual", False):
+            return
+        self._updater_manual = False
+        print("[UPDATE] 手动检查：已是最新，给出提示")
+        FluentMessageDialog(
+            self, "检查更新",
+            f"当前已是最新版本 SoloTalk {APP_VERSION}。",
+            informative="发现新版本时会提示你前往发布页手动下载。",
+            icon=D_ICON_OK, icon_color="#4CAF50",
+            buttons=(("好的", "primary", "ok"),)).exec_()
+
+    def _on_update_failed(self, msg):
+        """检查完成：无法获取更新信息。启动自动检查时静默；手动点击时给提示。"""
+        if not getattr(self, "_updater_manual", False):
+            return
+        self._updater_manual = False
+        print(f"[UPDATE] 手动检查：失败（{msg}），给出提示")
+        FluentMessageDialog(
+            self, "检查更新失败",
+            "无法获取更新信息，请检查网络后重试。",
+            informative=msg or "",
+            icon=D_ICON_WARN,
+            buttons=(("知道了", "primary", "ok"),)).exec_()
 
     def show_update_dialog(self, info):
         """展示「发现新版本」对话框，提供前往下载链接（外部浏览器打开）。"""
+        self._updater_manual = False   # 已有结果，清掉手动提示标志
         print(f"[UPDATE] 弹出更新提示对话框（新版本 {info.get('version', '')}）")
         dlg = QDialog(self)
         dlg.setWindowTitle("发现新版本")
@@ -1445,6 +1724,10 @@ D_ICON_DOC = [
     "M16 13H8",
     "M16 17H8",
     "M10 9H8",
+]
+D_ICON_OK = [   # 对勾圆环（Feather check-circle）：确认 / 已是最新 提示用
+    "M22 11.08V12a10 10 0 1 1-5.93-9.14",
+    "M22 4L12 14.01l-3-3",
 ]
 
 
@@ -1714,7 +1997,7 @@ class FluentMessageDialog(QDialog):
 
     def __init__(self, parent, title, message, informative="", icon=None,
                  buttons=(("确定", "primary", "ok"),), default_key="ok",
-                 min_width=440):
+                 min_width=440, icon_color="#E6A23C"):
         super().__init__(parent)
         self.clicked_key = None
         self.setWindowTitle(title)
@@ -1736,7 +2019,7 @@ class FluentMessageDialog(QDialog):
             ic = QLabel()
             ic.setFixedSize(36, 36)
             ic.setAlignment(Qt.AlignCenter)
-            ic.setPixmap(_svg_pixmap(icon, "#E6A23C", 30))   # 琥珀色警示
+            ic.setPixmap(_svg_pixmap(icon, icon_color, 30))   # 默认琥珀色警示；可传 icon_color 覆盖
             ic.setStyleSheet("background:transparent;")
             top.addWidget(ic, 0, Qt.AlignTop)
         col = QVBoxLayout()
@@ -2329,6 +2612,11 @@ class MorePage(QWidget):
         sc = QScrollArea()
         sc.setWidgetResizable(True)
         sc.setFrameShape(QFrame.NoFrame)
+        # ❗统一右侧内容区背景：滚动区与其视口一律透明 → 露出主窗口背景(#f5f6fa)，
+        #   消除「视口默认灰 #efefef」与「rv 的 26px 外边距 #f5f6fa」之间那道竖向色差。
+        sc.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        sc.viewport().setAutoFillBackground(False)
+        sc.viewport().setStyleSheet("background: transparent;")
         sc.setWidget(inner)
         return sc
 
@@ -2588,7 +2876,8 @@ class MorePage(QWidget):
         # 检查更新（手动）+ 启动时是否自动检查
         row = QHBoxLayout()
         row.setSpacing(14)
-        row.addWidget(self._primary_btn("检查更新", self.main._check_update))
+        row.addWidget(self._primary_btn(
+            "检查更新", lambda: self.main._check_update(manual=True)))
         self.chk_auto_update = QCheckBox("启动时自动检查更新")
         self.chk_auto_update.setCursor(Qt.PointingHandCursor)
         self.chk_auto_update.setChecked(bool(self.main.settings.get("auto_check_update", True)))
@@ -2696,7 +2985,6 @@ class MorePage(QWidget):
             "4、Part A 上传的视频需附带字幕",
             "5、若手机麦克风无法识别，请自行在设置中开启软件麦克风使用权限",
             "6、电脑版使用时不要关闭黑色弹窗",
-            "7、电脑版必须使用全英文路径",
         ]:
             v.addWidget(self._para(line, size=14))
 
@@ -4728,19 +5016,11 @@ class PracticePage(QWidget):
         这是修复"点击视频导致主线程卡死/未响应"的关键。"""
         if self._teardown_done:
             return
-        # ⚠️ 防「双解码器」：上一次播放若还没停干净（state 仍是 Playing/Paused），
-        #    直接 set_media() 会在旧解码管线尚未释放时新建一条，两条 h264 解码器
-        #    同时抢核显的 surface 池（表现为 `get_buffer() failed` 刷屏）。先停干净再播。
-        #    起播即作废任何还在后台跑的停止操作（防止它把这次新播放给停掉）
+        # ⚠️ 全程"媒体级"重活（停旧媒体 → set_media → play → 建 vout）都丢到**后台线程**，
+        # 主线程只做极快的 set_hwnd / setCurrentWidget / 调度定时器，绝不被 VLC 阻塞。
+        # 世代号：本次播放唯一标识；任何更新的播放/停止都会让它失效，杜绝过期动作踩踏新播放。
         self._vlc_gen = getattr(self, "_vlc_gen", 0) + 1
-        try:
-            if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
-                # 已经有一个后台停止在跑就别再叠一个（_stop_video 只等 50ms，
-                # 快速连点时很容易出现两个 stop 同时操作 player）。
-                if getattr(self, "_vlc_stop_pending", 0) == 0:
-                    self._stop_video()
-        except Exception:
-            pass
+        my_gen = self._vlc_gen
         if show_window and self.display_stack.currentWidget() != self.video_container:
             self.display_stack.setCurrentWidget(self.video_container)
         # 始终把 VLC 绑定到 video_frame —— 即使该控件当前被隐藏（如 Part A「听录音」：
@@ -4770,11 +5050,39 @@ class PracticePage(QWidget):
                 self._vlc_parent_hwnd = hwnd if hwnd else None
         except Exception:
             self._vlc_parent_hwnd = None
-        self.player.set_media(media)
-        self.player.play()
         vol = 0 if silent else 100
+        # 所有"重"动作统一一个后台线程**顺序**执行：先停干净旧媒体 → 装新媒体 → play（建 vout）。
+        # 旧写法是"停"和"播"分属两个线程，stop 线程的 set_media(None) 会撞掉新播放（双解码器/静音失效）；
+        # 合进一个 worker 后顺序有保证，且用 my_gen 防止更新的播放/停止接管后还残留动作。
+        def _run():
+            try:
+                if my_gen != self._vlc_gen:
+                    return  # 已有更新的播放/停止接管，放弃本次
+                # 1) 若还在播旧媒体，先停干净（线程内 stop，主线程不死锁；同 _stop_video 思路）
+                try:
+                    if self.player.get_state() in (vlc.State.Playing, vlc.State.Paused):
+                        self.player.audio_set_volume(0)
+                        self.player.stop()
+                        self.player.set_media(None)
+                except Exception:
+                    pass
+                if my_gen != self._vlc_gen:
+                    return
+                # 2) 装新媒体并起播（play 触发 vout 创建，在后台线程不卡 GUI）
+                self.player.set_media(media)
+                self.player.play()
+                try:
+                    self.player.audio_set_volume(vol)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+        # play() 之后立刻设音量会被 VLC 起播流程覆盖，延后 80ms 再设一次；
+        # 另加 600ms 兜底，确保后台线程起播较晚时音量（尤其 silent 静音）仍生效。
         QTimer.singleShot(80, lambda v=vol: self._delayed_set_volume(v))
-        # VLC 在 play() 之后才创建视频子窗口，稍后禁用其输入
+        QTimer.singleShot(600, lambda v=vol: self._delayed_set_volume(v))
+        # VLC 在 play() 之后才创建视频子窗口，稍后禁用其输入（输入禁用也在后台线程，见 _disable_vlc_input）
         QTimer.singleShot(150, self._disable_vlc_input)
 
     def _delayed_set_volume(self, vol):
@@ -5023,12 +5331,11 @@ class PracticePage(QWidget):
             QMessageBox.warning(self, "批改", "Vosk 模型不可用，录音已保存，稍后可重新批改。")
             self._save_history()
             return
-        self._perform_evaluation(vosk_model)
-        self._save_history()
-        QMessageBox.information(self, "批改完成", "练习记录与参考批改已保存至历史记录。")
-
-    def _perform_evaluation(self, vosk_model):
-        # 专项训练：只批改选定的篇目，其余篇目从评估结果与历史里剥离，避免误显示/误算总分
+        recs = {
+            "partA": self.session.partA_recording,
+            "partB": self.session.partB_slots,
+            "partC": self.session.partC_recording,
+        }
         selection = None
         if self.mode == "special":
             sel = self.selected_parts
@@ -5038,14 +5345,14 @@ class PracticePage(QWidget):
                 'partB_five': {i: ('B' in sel) for i in range(len(self.pkg.partB_five_answers))},
                 'partC': 'C' in sel,
             }
-        self.session.evaluation = evaluate_recordings({
-            "partA": self.session.partA_recording,
-            "partB": self.session.partB_slots,
-            "partC": self.session.partC_recording,
-        }, self.pkg, vosk_model, selection=selection)
+        ev = grade_with_progress(self, recs, self.pkg, vosk_model, selection=selection)
+        if ev is None:
+            # 批改异常：录音已落盘，存一次无评分历史，稍后可重批
+            self._save_history()
+            return
+        self.session.evaluation = ev
         if self.mode == "special":
             # 剥离未训练篇目的占位结果，详情页/总分只反映本次训练的篇目
-            ev = self.session.evaluation
             if 'A' not in self.selected_parts:
                 ev.pop('partA', None)
             if 'B' not in self.selected_parts:
@@ -5053,6 +5360,8 @@ class PracticePage(QWidget):
                 ev.pop('partB_five', None)
             if 'C' not in self.selected_parts:
                 ev.pop('partC', None)
+        self._save_history()
+        QMessageBox.information(self, "批改完成", "练习记录与参考批改已保存至历史记录。")
 
     def _save_history(self):
         os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -5294,6 +5603,8 @@ class QuestionBankPage(QWidget):
         self.setStyleSheet(
             f"#bankRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f" stop:0 {self.BG_TOP}, stop:1 {self.BG_BOT}); }}")
+        # QWidget 子类默认不绘制 QSS 背景 → 渐变被主窗口 #f5f6fa 透出；开启后才能正确画出页面渐变
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._items = []
         self._loaded = False
         self._page = 0            # 已加载到第几页
@@ -5356,6 +5667,8 @@ class QuestionBankPage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
+        # 视口默认是 Fusion 的 #EFEFEF 灰，会盖在页面渐变之上形成色差 —— 必须一并透明
+        scroll.viewport().setStyleSheet("background:transparent;")
         self.list_widget = QWidget()
         self.list_lay = QVBoxLayout(self.list_widget)
         self.list_lay.setContentsMargins(0, 0, 0, 0)
@@ -5768,6 +6081,67 @@ class QuestionBankPage(QWidget):
 
 
 # ------------------ 历史记录页面 ------------------
+# ------------------ 历史记录：总分列辅助 ------------------
+def _eval_total_score(ev):
+    """从 evaluation dict 算总分，返回 (score, max)。
+
+    与详情页 `HistoryPage._detail_eval_card` 同一套算法：
+      Part A = accuracy*20；Part B 每题 2 分（相似度*2）；Part C = semantic_sim*24；
+      分母按实际出现的篇目动态求和（专项训练只算选定篇目，避免 x.x/60 误导）。
+    无任何可评分内容时返回 (None, 0)。
+    """
+    if not ev:
+        return None, 0
+    PART_A_MAX, PART_B_PER_ITEM, PART_C_MAX = 20, 2, 24
+    score, maxv = 0.0, 0
+    if 'partA' in ev:
+        try:
+            score += float(ev['partA'].get('accuracy', 0) or 0) * PART_A_MAX
+        except (TypeError, ValueError):
+            pass
+        maxv += PART_A_MAX
+    nb = 0
+    for key in ('partB_three', 'partB_five'):
+        for t in (ev.get(key) or []):
+            sim = t.get('similarity', 0) if isinstance(t, dict) else 0
+            try:
+                score += float(sim or 0) * PART_B_PER_ITEM
+            except (TypeError, ValueError):
+                pass
+            nb += 1
+    maxv += nb * PART_B_PER_ITEM
+    if 'partC' in ev:
+        sem = ev['partC'].get('semantic_sim')
+        try:
+            sem = float(sem) if sem is not None else None
+        except (TypeError, ValueError):
+            sem = None
+        if sem is not None:
+            score += sem * PART_C_MAX
+        maxv += PART_C_MAX
+    return (score, maxv) if maxv else (None, 0)
+
+
+class _HistRow(QTreeWidgetItem):
+    """历史列表行：让「总分」列（第 1 列）按**数值**排序，其余列沿用默认（DisplayRole 文本）。
+
+    默认 QTreeWidgetItem 对 "52.3/60" 这类文本按字典序排（"9.0/60" 会排在 "52.3/60" 前），
+    故需按存储的数值比较。
+    """
+    SCORE_ROLE = Qt.UserRole + 1
+
+    def __lt__(self, other):
+        tw = self.treeWidget()
+        if tw is not None and tw.sortColumn() == 1:
+            a = self.data(1, self.SCORE_ROLE)
+            b = other.data(1, self.SCORE_ROLE)
+            try:
+                return float(a) < float(b)
+            except (TypeError, ValueError):
+                return str(a) < str(b)
+        return QTreeWidgetItem.__lt__(self, other)
+
+
 class HistoryPage(QWidget):
     # 分类徽标配色（与详情页 _d_chip 同一体系：浅底 + 细描边 + 深字）
     _MODE_STYLES = {
@@ -5782,7 +6156,7 @@ class HistoryPage(QWidget):
         self.setObjectName("hsRoot")
         self.setStyleSheet(
             f"#hsRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            f" stop:0 {D_BG_TOP}, stop:1 {D_BG_BOT}); }}")
+            f" stop:0 #FAFBFC, stop:1 #F2F4F7); }}")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 22, 28, 18)
@@ -5810,8 +6184,8 @@ class HistoryPage(QWidget):
 
         self.list_widget = QTreeWidget()
         self.list_widget.setObjectName("hsTree")
-        self.list_widget.setColumnCount(3)
-        self.list_widget.setHeaderLabels(["标题", "分类", "时间"])
+        self.list_widget.setColumnCount(4)
+        self.list_widget.setHeaderLabels(["标题", "总分", "分类", "时间"])
         self.list_widget.setRootIsDecorated(False)
         self.list_widget.setUniformRowHeights(True)
         self.list_widget.setAllColumnsShowFocus(True)
@@ -5828,19 +6202,23 @@ class HistoryPage(QWidget):
         hh = self.list_widget.header()
         hh.setSectionsMovable(False)
         hh.setStretchLastSection(False)
-        # ❗列宽规则（2026-09-28 用户最终定稿）：
-        #  · 标题(0)=Stretch 占满左侧剩余宽度；分类(1)、时间(2)=Fixed 固定宽、固定位置、贴最右。
-        #  · 拖拽能力删除：分类/时间是 Fixed → 两根分隔线都拖不动（用户："拉动就删了"）。
+        # ❗列宽规则（2026-10-02 调整：在 标题 与 分类 之间新增「总分」列）：
+        #  · 标题(0)=Stretch 占满左侧剩余宽度；总分(1)、分类(2)、时间(3)=Fixed 固定宽、贴最右。
+        #  · 拖拽能力删除：固定列都是 Fixed → 分隔线都拖不动（用户："拉动就删了"）。
         #    标题是 Stretch 也没法拖 —— 它本就是自适应撑满。整体"列宽不可手动调"。
-        #  · 排序照旧保留（setSortingEnabled + sortByColumn）。
+        #  · 排序照旧保留（setSortingEnabled + sortByColumn；总分列按数值排）。
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.Fixed)
         hh.setSectionResizeMode(2, QHeaderView.Fixed)
-        hh.resizeSection(1, 132)
-        hh.resizeSection(2, 178)
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)
+        hh.resizeSection(1, 96)     # 总分
+        hh.resizeSection(2, 132)    # 分类
+        hh.resizeSection(3, 178)    # 时间
         hh.setMinimumSectionSize(56)
         self.list_widget.headerItem().setTextAlignment(
-            2, Qt.AlignRight | Qt.AlignVCenter)
+            1, Qt.AlignRight | Qt.AlignVCenter)   # 总分
+        self.list_widget.headerItem().setTextAlignment(
+            3, Qt.AlignRight | Qt.AlignVCenter)   # 时间
 
         # ⚠️ QFrame 选择器会命中 QLabel，全部用 #objectName 限定
         # ❗padding-right 必须留够（26px）：排序指示箭头由 style 画在 section 右端，
@@ -5901,7 +6279,7 @@ class HistoryPage(QWidget):
             try:
                 with open(f, 'r', encoding='utf-8') as fh:
                     data = json.load(fh)
-                # 结构化三列：标题 | 分类 | 时间。
+                # 结构化四列：标题 | 总分 | 分类 | 时间。
                 # 分类是带配色的徽标（练习/模考/专项训练·篇目）；旧记录无 mode 字段 → 按「练习」回退（与详情徽标一致）
                 mode = data.get('mode', '') or 'practice'
                 label, bg, bd, fg = self._MODE_STYLES.get(
@@ -5913,14 +6291,28 @@ class HistoryPage(QWidget):
                 ts = str(data.get('timestamp', ''))
                 ts_clean = ts.split('.')[0].replace('T', ' ') if ts else ''
 
-                it = QTreeWidgetItem([str(data.get('package', '?')), label, ts_clean])
+                # 总分列（标题与分类之间）：与详情页同一算法；无评分显示「—」
+                tscore, tmax = _eval_total_score(data.get('evaluation') or {})
+                if tscore is None:
+                    score_txt, score_color, score_key = "—", D_MUTED, -1.0
+                else:
+                    ratio = tscore / tmax if tmax else 0
+                    score_color = ('#c0392b' if ratio < 0.6 else
+                                   '#e67e22' if ratio < 0.8 else '#27ae60')
+                    score_txt = f"{tscore:.1f}/{tmax}"
+                    score_key = tscore
+
+                it = _HistRow([str(data.get('package', '?')), score_txt, label, ts_clean])
                 it.setData(0, Qt.UserRole, str(f))
-                it.setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
-                it.setForeground(2, QBrush(QColor(D_SUB)))
-                # ❗分类列的文字只为「点表头能按分类排序」而存在（排序用 DisplayRole 文本）。
+                it.setData(1, _HistRow.SCORE_ROLE, score_key)   # 供「总分」列数值排序
+                it.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                it.setForeground(1, QBrush(QColor(score_color)))
+                it.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
+                it.setForeground(3, QBrush(QColor(D_SUB)))
+                # ❗分类列(2)的文字只为「点表头能按分类排序」而存在（排序用 DisplayRole 文本）。
                 #   必须设成全透明：否则 delegate 会把黑字画在 chip 底下，chip 盖不住的
                 #   左边缘 1~2px 就露出 ClearType 亚像素边缘 —— 用户看到的那个"小黑点"。
-                it.setForeground(1, QBrush(Qt.transparent))
+                it.setForeground(2, QBrush(Qt.transparent))
                 self.list_widget.addTopLevelItem(it)
 
                 # 分类列放彩色徽标（setItemWidget 会铺满单元格，外面套一层留边）
@@ -5938,11 +6330,11 @@ class HistoryPage(QWidget):
                     f"#hsChip{{background:{bg};border:1px solid {bd};"
                     f"border-radius:9px;color:{fg};}}")
                 wl.addWidget(chip)
-                self.list_widget.setItemWidget(it, 1, wrap)
+                self.list_widget.setItemWidget(it, 2, wrap)
             except:
                 pass
         if self.list_widget.topLevelItemCount() == 0:
-            empty = QTreeWidgetItem(["（暂无练习记录）", "", ""])
+            empty = QTreeWidgetItem(["（暂无练习记录）", "", "", ""])
             empty.setDisabled(True)
             empty.setForeground(0, QBrush(QColor(D_MUTED)))
             self.list_widget.addTopLevelItem(empty)
@@ -5951,7 +6343,7 @@ class HistoryPage(QWidget):
         # 启用排序（点表头即排），默认按时间降序（最新在前）。
         # 时间列文本为 "YYYY-MM-DD HH:MM:SS"，零填充，字典序==时间序。
         self.list_widget.setSortingEnabled(True)
-        self.list_widget.sortByColumn(2, Qt.DescendingOrder)
+        self.list_widget.sortByColumn(3, Qt.DescendingOrder)   # 时间列（现为第 3 列）
         # 列宽规则：标题=Stretch 占满左侧，分类/时间=Fixed 固定贴右（不参与排序箭头布局）。
         # 排序照旧保留：点表头即排，默认按时间降序。
 
@@ -5984,7 +6376,9 @@ class HistoryPage(QWidget):
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except:
-            QMessageBox.critical(self, "错误", "历史记录文件损坏")
+            FluentMessageDialog(self, "文件损坏",
+                                "历史记录文件损坏，无法打开。",
+                                buttons=(("知道了", "primary", "ok"),)).exec_()
             return
         recs = data.get('recordings', {})
         pkg_dict = data.get('package_data', {})
@@ -5996,118 +6390,123 @@ class HistoryPage(QWidget):
         n3 = len(temp_pkg.partB_three_questions)
         n5 = len(temp_pkg.partB_five_answers)
 
-        # ── 弹出多选对话框（与详情弹窗风格统一）──
+        # ── 弹出多选对话框（Fluent 卡片版：扁平 + 胶囊徽标 + 清晰层级，与首页/详情同源）──
         dlg = QDialog(self)
         dlg.setWindowTitle("选择重新批改的部分")
         dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        dlg.setMinimumWidth(340)
+        dlg.setObjectName("rgRoot")
+        dlg.setStyleSheet(
+            f"#rgRoot {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f" stop:0 {D_BG_TOP}, stop:1 {D_BG_BOT}); }}")
+        dlg.setMinimumWidth(420)
 
-        dlg_layout = QVBoxLayout()
-        dlg_layout.setContentsMargins(0, 0, 0, 0)
-        dlg_layout.setSpacing(0)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(24, 22, 24, 18)
+        root.setSpacing(14)
 
-        # 浅灰外框（与详情弹窗一致）
-        outer = QWidget()
-        outer.setStyleSheet("background:#f5f6fa")
-        outer_layout = QVBoxLayout(outer)
-        outer_layout.setContentsMargins(20, 18, 20, 14)
-        outer_layout.setSpacing(10)
+        # 标题行：图标 + 标题 + 说明
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        ic = QLabel()
+        ic.setFixedSize(34, 34)
+        ic.setAlignment(Qt.AlignCenter)
+        ic.setPixmap(_svg_pixmap(D_ICON_CHART, D_ACCENT_DEEP, 26))
+        ic.setStyleSheet("background:transparent;")
+        head.addWidget(ic, 0, Qt.AlignTop)
+        hcol = QVBoxLayout()
+        hcol.setSpacing(5)
+        hcol.addWidget(_d_label("选择重新批改的部分", 16, D_TEXT, medium=True, wrap=False))
+        hcol.addWidget(_d_label("勾选要重新批改的部分，未勾选的保持原评分。", 12, D_MUTED, wrap=True))
+        head.addLayout(hcol, 1)
+        root.addLayout(head)
 
-        tip = QLabel("请选择要重新批改的部分：")
-        tip.setFont(QFont("Microsoft YaHei", 12))
-        tip.setStyleSheet("color:#333;padding:2px 0 8px;")
-        outer_layout.addWidget(tip)
+        checks = []  # (selection键, 字母, 卡片按钮)
 
-        checks = []  # (selection键, QCheckBox)
+        def _add_row(key, letter, badge_bg, badge_fg, text):
+            card = QPushButton()
+            card.setObjectName("rgCard")
+            card.setCheckable(True)
+            card.setChecked(True)
+            card.setFixedHeight(54)
+            card.setCursor(Qt.PointingHandCursor)
+            card.setStyleSheet(
+                f"#rgCard {{ background:{D_CARD}; border:1px solid {D_BD};"
+                f" border-radius:12px; padding:0px; text-align:left; }}"
+                f"#rgCard:checked {{ background:{D_ACCENT_SOFT};"
+                f" border:1.5px solid {D_ACCENT_DEEP}; }}"
+                f"#rgCard:hover {{ border:1px solid {D_ACCENT}; }}")
+            lay = QHBoxLayout(card)
+            lay.setContentsMargins(14, 0, 14, 0)
+            lay.setSpacing(12)
+            bd = QLabel(letter)
+            bd.setFixedSize(30, 30)
+            bd.setAlignment(Qt.AlignCenter)
+            _bind_font(bd, 15, medium=True)
+            bd.setStyleSheet(
+                f"background:{badge_bg}; color:{badge_fg};"
+                f" border-radius:15px; padding:0px;")
+            bd.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            lay.addWidget(bd)
+            tx = _d_label(text, 14, D_TEXT, wrap=False)
+            tx.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            lay.addWidget(tx, 1)
+            ck = QLabel()
+            ck.setFixedSize(20, 20)
+            ck.setAlignment(Qt.AlignCenter)
+            ck.setPixmap(_svg_pixmap(_SPECIAL_CHECK, D_ACCENT_DEEP, 18))
+            ck.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            lay.addWidget(ck)
+            card.toggled.connect(lambda on, c=ck: c.setVisible(on))
+            root.addWidget(card)
+            checks.append((key, letter, card))
 
         if recs.get('partA'):
-            cb = QCheckBox("Part A 模仿朗读")
-            cb.setFont(QFont("Microsoft YaHei", 12))
-            cb.setChecked(True)
-            checks.append(('partA', None, cb))
-            outer_layout.addWidget(cb)
-
+            _add_row('partA', 'A', "#E3F2FD", "#1565C0", "Part A  模仿朗读")
         has_b3 = any(b3[i] for i in range(min(len(b3), n3)))
         if has_b3:
-            cb = QCheckBox("Part B 三问")
-            cb.setFont(QFont("Microsoft YaHei", 12))
-            cb.setChecked(True)
-            checks.append(('partB_three', None, cb))
-            outer_layout.addWidget(cb)
-
+            _add_row('partB_three', 'B', "#F7DCDC", "#C0392B", "Part B  三问")
         has_b5 = any(b5[i] for i in range(min(len(b5), n5)))
         if has_b5:
-            cb = QCheckBox("Part B 五答")
-            cb.setFont(QFont("Microsoft YaHei", 12))
-            cb.setChecked(True)
-            checks.append(('partB_five', None, cb))
-            outer_layout.addWidget(cb)
-
+            _add_row('partB_five', 'B', "#F7DCDC", "#C0392B", "Part B  五答")
         if recs.get('partC'):
-            cb = QCheckBox("Part C 故事复述")
-            cb.setFont(QFont("Microsoft YaHei", 12))
-            cb.setChecked(True)
-            checks.append(('partC', None, cb))
-            outer_layout.addWidget(cb)
+            _add_row('partC', 'C', "#FFFDE7", "#9E7B00", "Part C  故事复述")
 
         if not checks:
-            QMessageBox.information(self, "提示", "该记录没有可重新批改的录音")
+            FluentMessageDialog(self, "无可批改内容",
+                                "该记录没有可重新批改的录音。",
+                                buttons=(("知道了", "primary", "ok"),)).exec_()
             return
 
-        # 按钮（紫系，与详情弹窗关闭按钮一致）
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
-        _btn_style = """
-            QPushButton {
-                background: #5b4fcf;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 15px;
-                padding: 8px 30px;
-                min-height: 40px;
-            }
-            QPushButton:hover { background: #4a3eb8; }
-            QPushButton:pressed { background: #3d32a0; }
-        """
-        _btn_style_cancel = """
-            QPushButton {
-                background: #e0e0e0;
-                color: #222;
-                border: none;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 15px;
-                padding: 8px 30px;
-                min-height: 40px;
-            }
-            QPushButton:hover { background: #cfcfcf; }
-            QPushButton:pressed { background: #bebebe; }
-        """
-
+        root.addSpacing(2)
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        foot.addStretch(1)
         btn_cancel = QPushButton("取消")
-        btn_cancel.setStyleSheet(_btn_style_cancel)
-        btn_ok = QPushButton("确定")
-        btn_ok.setStyleSheet(_btn_style)
-        btn_ok.setDefault(True)
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        btn_cancel.setFixedHeight(38)
+        btn_cancel.setMinimumWidth(96)
+        _bind_font(btn_cancel, 13)
+        btn_cancel.setStyleSheet(FluentMessageDialog._btn_qss("secondary"))
         btn_cancel.clicked.connect(dlg.reject)
+        btn_ok = QPushButton("确定")
+        btn_ok.setCursor(Qt.PointingHandCursor)
+        btn_ok.setFixedHeight(38)
+        btn_ok.setMinimumWidth(96)
+        _bind_font(btn_ok, 13, medium=True)
+        btn_ok.setStyleSheet(FluentMessageDialog._btn_qss("primary"))
         btn_ok.clicked.connect(dlg.accept)
-        btn_row.addWidget(btn_cancel)
-        btn_row.addWidget(btn_ok)
-        outer_layout.addLayout(btn_row)
-
-        dlg_layout.addWidget(outer)
-        dlg.setLayout(dlg_layout)
+        btn_ok.setDefault(True)
+        foot.addWidget(btn_cancel)
+        foot.addWidget(btn_ok)
+        root.addLayout(foot)
 
         if dlg.exec_() != QDialog.Accepted:
             return
 
         # ── 构建 selection（勾选的 Part → 其下所有子项全选）──
         selection = {}
-        for key, idx, cb in checks:
-            if cb.isChecked():
+        for key, letter, card in checks:
+            if card.isChecked():
                 if key in ('partA', 'partC'):
                     selection[key] = True
                 elif key == 'partB_three':
@@ -6115,22 +6514,30 @@ class HistoryPage(QWidget):
                 elif key == 'partB_five':
                     selection[key] = {i: True for i in range(n5) if i < len(b5) and b5[i]}
         if not selection:
-            QMessageBox.information(self, "提示", "未选择任何题目，已取消重新批改")
+            FluentMessageDialog(self, "未选择任何题目",
+                                "未选择任何题目，已取消重新批改。",
+                                buttons=(("知道了", "primary", "ok"),)).exec_()
             return
 
         vosk_model = load_vosk_model()
         if not vosk_model:
-            QMessageBox.warning(self, "错误", "Vosk 模型不可用，无法重新批改")
+            FluentMessageDialog(self, "无法重新批改",
+                                "Vosk 模型不可用，无法重新批改。",
+                                buttons=(("知道了", "primary", "ok"),)).exec_()
             return
 
         existing_eval = data.get('evaluation') or {}
-        eval_result = evaluate_recordings(recs, temp_pkg, vosk_model,
+        eval_result = grade_with_progress(self, recs, temp_pkg, vosk_model,
                                           existing_eval=existing_eval, selection=selection)
+        if eval_result is None:
+            return
         data['evaluation'] = eval_result
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-        cnt = sum(1 for _, _, cb in checks if cb.isChecked())
-        QMessageBox.information(self, "完成", f"已重新批改 {cnt} 个题目")
+        cnt = sum(1 for _, _, card in checks if card.isChecked())
+        FluentMessageDialog(self, "重新批改完成",
+                            f"已重新批改 {cnt} 个题目。",
+                            buttons=(("知道了", "primary", "ok"),)).exec_()
         self.load_history()
 
     # ═══════════════════════ 练习详情（Fluent 卡片版）═══════════════════════
@@ -7001,15 +7408,55 @@ def _esc(s):
                   .replace('"', '&quot;').replace('\n', '<br>')
 
 
+def _vosk_model_ansi(path):
+    """用 ANSI 代码页重试加载 vosk 模型 —— 兼容含中文等非 ASCII 字符的路径。
+
+    ❗根因（2026-10-01 实测定位）：`vosk.Model(path)` 内部只是
+    `_c.vosk_model_new(path.encode("utf-8"))`，真正解析路径的是 **libvosk.dll
+    (C++/Kaldi) 里的原生文件 API** —— Windows 上它按「ANSI 代码页」(简中=GBK)
+    解释路径字节，拿到 UTF-8 字节串就乱码 → 找不到目录 → 返回 NULL →
+    `raise Exception("Failed to create a model")`。
+    实测（中文目录 + 同一份完整模型）：
+        vosk_model_new(path.encode("utf-8")) -> NULL
+        vosk_model_new(path.encode("mbcs"))  -> 句柄有效
+    推论：① 路径用 `os.path` 还是 `pathlib` 拼**完全无关**，瓶颈在 C 库编码；
+          ② 路径只要含中文，标准调用必失败（哪怕模型目录存在、路径合法）。
+    这里跳过 vosk 封装，直接用 cffi 接口传 ANSI 编码路径。
+    """
+    try:
+        import vosk as _v
+    except Exception:
+        return None
+    for enc in ("mbcs", "cp936"):
+        try:
+            h = _v._c.vosk_model_new(path.encode(enc))
+        except Exception:
+            continue
+        if h != _v._ffi.NULL:
+            m = _v.Model.__new__(_v.Model)
+            m._handle = h        # 交给 Model.__del__ 正常释放
+            return m
+    return None
+
+
 def load_vosk_model():
     if not VOSK_AVAILABLE:
         return None
     if not os.path.exists(MODEL_PATH):
         return None
-    return Model(MODEL_PATH)
+    try:
+        return Model(MODEL_PATH)
+    except Exception as e:
+        # 中文路径兜底：改用 ANSI 编码重试（详见 _vosk_model_ansi 注释）
+        m = _vosk_model_ansi(MODEL_PATH)
+        if m is not None:
+            print(f"[VOSK] 路径含非 ASCII 字符，已用 ANSI 兼容模式加载模型: {MODEL_PATH}")
+            return m
+        print(f"[VOSK] 模型加载失败: {type(e).__name__}: {e}")
+        return None
 
 # ===== 更新检查（仅提示，不自动下载/替换）=====
-APP_VERSION = "2.3"   # 当前版本号；发布新版本时只改这一处
+APP_VERSION = "2.4"   # 当前版本号；发布新版本时只改这一处
 # version.json 放在 GitHub 仓库根目录。更新源顺序：
 #   1) GitHub API：读实时文件、无 CDN 缓存，改完立即生效（优先）；
 #   2) jsDelivr：国内直连快，但有缓存，作兜底；
@@ -7028,6 +7475,8 @@ CHANNEL = "mobile" if hasattr(sys, "getandroidapilevel") else "desktop"
 
 class UpdateChecker(QThread):
     update_available = pyqtSignal(dict)   # {version, notes, url}
+    no_update = pyqtSignal()              # 检查完成：已是最新（供手动检查给提示）
+    check_failed = pyqtSignal(str)        # 检查完成：无法获取更新信息（网络/源不可用/解析失败）
 
     def run(self):
         print(f"[UPDATE] 开始检查更新（通道={CHANNEL}，本机版本={APP_VERSION}）")
@@ -7058,11 +7507,13 @@ class UpdateChecker(QThread):
                 print(f"[UPDATE] 该源不可用，换下一个: {url}  ({type(e).__name__}: {e})")
         if data is None:
             print("[UPDATE] 所有更新源均不可用（已忽略，不影响使用）")
+            self.check_failed.emit("无法连接更新服务器（所有更新源均不可用）")
             return
         try:
             info = data.get(CHANNEL, data.get("desktop", {}))
             if not info:
                 print(f"[UPDATE] version.json 缺少 {CHANNEL} 通道信息，跳过")
+                self.check_failed.emit(f"更新信息缺少 {CHANNEL} 通道")
                 return
             latest = str(info.get("version", ""))
             if latest and self._is_newer(latest, APP_VERSION):
@@ -7074,8 +7525,10 @@ class UpdateChecker(QThread):
                 })
             else:
                 print(f"[UPDATE] 已是最新（本机 {APP_VERSION} >= 远端 {latest}），无需更新")
+                self.no_update.emit()
         except Exception as e:
             print(f"[UPDATE] 解析失败（已忽略）: {e}")
+            self.check_failed.emit(f"解析更新信息失败：{e}")
 
     @staticmethod
     def _is_newer(latest, current):
