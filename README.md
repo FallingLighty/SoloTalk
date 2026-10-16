@@ -4,7 +4,7 @@
 
 交流群：QQ：1091799764  点击链接加入群聊【SoloTalkの创意工坊】：https://qm.qq.com/q/o4Yfw2jsDm
 
-![工坊](https://cdn.wakudemo.cn/games/101818/w-ms64m0w1dmxf1v/images/Game101818Pic126defb5a9d.jpg)
+<img width="1284" height="2283" alt="image" src="https://github.com/user-attachments/assets/9ff40b10-003b-4a47-a5fc-2af8d4c2afba" />
 
 哔哩哔哩个人主页：[晖落然的个人空间-晖落然个人主页-哔哩哔哩视频](https://space.bilibili.com/1667914290)
 
