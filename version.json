@@ -1,8 +1,8 @@
 {
   "desktop": {
-    "version": "2.5",
-    "notes": "2.5：① 软件启动时下载模型② 模型检查页可显示Vosk / BGE 实际占用体积 ③练习详情「录音文件」新增「打开录音文件夹」，一键打开本次录音所在目录。",
-    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.5-desktop/SoloTalk_v2.5.7z"
+    "version": "2.6",
+    "notes": "2.6：① 编辑界面重做（Part 文档标签页、顶栏按钮等高、「更多」侧栏单色图标）；② 三问五答标准答案支持多条增删（+ / -），批改取最佳匹配；③ 情景介绍可添加配图，「情景介绍」「听对话」两步优先显示图片+文字；④ Part C 默认上传音频、修复勾选框对勾与孤立标签；⑤ mpv 随包附带 Vulkan loader，修复无显卡驱动电脑启动失败，异常时改显示真实错误码与处理建议。",
+    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.6-desktop/SoloTalk_v2.6.7z"
   },
   "mobile": {
     "version": "2.2",
