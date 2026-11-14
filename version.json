@@ -1,8 +1,8 @@
 {
   "desktop": {
     "version": "2.6",
-    "notes": "2.6：① 编辑界面重做（Part 文档标签页、顶栏按钮等高、「更多」侧栏单色图标）；② 三问五答标准答案支持多条增删（+ / -），批改取最佳匹配；③ 情景介绍可添加配图，「情景介绍」「听对话」两步优先显示图片+文字；④ Part C 默认上传音频、修复勾选框对勾与孤立标签；⑤ mpv 随包附带 Vulkan loader，修复无显卡驱动电脑启动失败，异常时改显示真实错误码与处理建议。",
-    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.6-desktop/SoloTalk_v2.6.7z"
+    "notes": "2.7（请运行安装程序）：① 启动明显提速（onnxruntime 优先加载、模型延迟导入、启动自检 splash）；② 改为按用户目录安装、无需管理员提权，卸载可分别选择删除模型/用户数据并解绑 .solo；③ .solo 双击可选练习/模考/专项/编辑四种打开方式；④ 练习详情页新增原文与录音回放，细进度条可实时拖动、各条互不干扰，播完自动复位；⑤ 白色提示卡与中文浅色右键菜单，视频区 16:9 自适应、去除黑框；⑥ 三问显示原文回答，标题层级与麦克风测试窗口调整；⑦ BGE 模型只保留一份 onnx 文件，减小体积；⑧ 默认改用 Comic Sans MS，鸿蒙字体改为可选下载/本地导入（不随包分发），下载完成有提示并可直接选用。",
+    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.7-desktop/SoloTalk_Setup_2.7.exe"
   },
   "mobile": {
     "version": "2.2",
