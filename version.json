@@ -8,11 +8,12 @@
     "setup_sha256": "f916202746246f8345c74eb77d3c98201a34bfe68f2f95ce9cf8caf84f8c2602"
   },
 
-
-
   "mobile": {
-    "version": "2.2",
-    "notes": "2.2：新增题库页",
-    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.2-mobile/SoloTalk_v2.2.apk"
+    "version": "2.5",
+    "notes": "2.5（测试用假版本）：验证应用内一键更新流程 —— 下载进度、sha256 校验、系统安装器、安装未知应用授权。",
+    "url": "https://github.com/FallingLighty/SoloTalk/releases/tag/v2.4-mobile",
+    "apk_url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.4-mobile/SoloTalk_v2.4.apk",
+    "size": 235784207,
+    "sha256": "901c219d1c18e5565b6e39a9ce05efd683119c717bdce5b4ce8ca34eab5a10ab"
   }
 }
