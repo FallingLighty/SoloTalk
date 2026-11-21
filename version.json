@@ -1,12 +1,13 @@
 {
   "desktop": {
-   "version": "2.9",
-   "notes": "【仅用于测试自动更新，请勿安装】本版本是故意指回 2.7 安装包的测试配置。",
-   "url": "https://github.com/FallingLighty/SoloTalk/releases/tag/v2.7-desktop",
-   "setup_url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.7-desktop/SoloTalk_Setup_2.7.exe",
-   "setup_size": 142094821,
-   "setup_sha256": ""
-}
+    "version": "2.9",
+    "notes": "【仅用于测试自动更新，请勿安装】本版本是故意指回 2.7 安装包的测试配置。",
+    "url": "https://github.com/FallingLighty/SoloTalk/releases/tag/v2.7-desktop",
+    "setup_url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.7-desktop/SoloTalk_Setup_2.7.exe",
+    "setup_size": 142094821,
+    "setup_sha256": ""
+  },
+
 
   "mobile": {
     "version": "2.2",
