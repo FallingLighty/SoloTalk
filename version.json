@@ -1,9 +1,13 @@
 {
   "desktop": {
-    "version": "2.7",
-    "notes": "2.7（请运行安装程序）：① 启动明显提速（onnxruntime 优先加载、模型延迟导入、启动自检 splash）；② 改为按用户目录安装、无需管理员提权，卸载可分别选择删除模型/用户数据并解绑 .solo；③ .solo 双击可选练习/模考/专项/编辑四种打开方式；④ 练习详情页新增原文与录音回放，细进度条可实时拖动、各条互不干扰，播完自动复位；⑤ 白色提示卡与中文浅色右键菜单，视频区 16:9 自适应、去除黑框；⑥ 三问显示原文回答，标题层级与麦克风测试窗口调整；⑦ BGE 模型只保留一份 onnx 文件，减小体积；⑧ 默认改用 Comic Sans MS，鸿蒙字体改为可选下载/本地导入（不随包分发），下载完成有提示并可直接选用。",
-    "url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.7-desktop/SoloTalk_Setup_2.7.exe"
-  },
+  "version": "2.9",
+  "notes": "【仅用于测试自动更新，请勿安装】本版本是故意指回 2.7 安装包的测试配置。",
+  "url": "https://github.com/FallingLighty/SoloTalk/releases/tag/v2.7-desktop",
+  "setup_url": "https://github.com/FallingLighty/SoloTalk/releases/download/v2.7-desktop/SoloTalk_Setup_2.7.exe",
+  "setup_size": 142094821,
+  "setup_sha256": ""
+}
+
   "mobile": {
     "version": "2.2",
     "notes": "2.2：新增题库页",
